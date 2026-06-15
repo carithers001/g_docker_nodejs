@@ -17,8 +17,8 @@ if [ "$IPV" != "4" ] && [ "$IPV" != "6" ]; then
     exit 1
 fi
 
-WSPORT=$(get_free_port)
-METRICSPORT=$(get_free_port)
+# WSPORT=$(get_free_port)
+METRICSPORT=8080
 
 echo "[x-tunnel] 启动，监听端口 $WSPORT ..."
 if [ -z "$TOKEN" ]; then
