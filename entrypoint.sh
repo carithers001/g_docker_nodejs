@@ -1,41 +1,60 @@
 #!/bin/bash
+set -e
 
-# 定义端口
-WS_PORT=8080
-METRICS_PORT=8081
+get_free_port() {
+    while true; do
+        PORT=$((RANDOM + 1024))
+        if ! lsof -i TCP:$PORT >/dev/null 2>&1; then
+            echo $PORT
+            return
+        fi
+    done
+}
 
-# 1. 启动本地 x-tunnel 服务 (丢入后台运行)
-echo "正在启动后台 x-tunnel..."
-if [ -z "$TOKEN" ]; then
-    /usr/local/bin/x-tunnel -l ws://127.0.0.1:$WS_PORT &
-else
-    echo "检测到 Token: $TOKEN"
-    /usr/local/bin/x-tunnel -l ws://127.0.0.1:$WS_PORT -token "$TOKEN" &
+# 验证 IPV 参数
+if [ "$IPV" != "4" ] && [ "$IPV" != "6" ]; then
+    echo "[错误] IPV 环境变量必须为 4 或 6，当前值: $IPV"
+    exit 1
 fi
 
-# 2. 启动 Cloudflared 内网穿透 (丢入后台运行)
-echo "正在启动 Cloudflare Argo Tunnel..."
-/usr/local/bin/cloudflared tunnel --url 127.0.0.1:$WS_PORT --metrics 0.0.0.0:$METRICS_PORT &
+WSPORT=$(get_free_port)
+METRICSPORT=$(get_free_port)
 
-# 3. 循环等待并抓取分配的临时域名
-echo "正在获取 Cloudflare 分配的白嫖域名..."
+echo "[x-tunnel] 启动，监听端口 $WSPORT ..."
+if [ -z "$TOKEN" ]; then
+    screen -dmUS x-tunnel /app/x-tunnel-linux -l ws://127.0.0.1:$WSPORT
+else
+    screen -dmUS x-tunnel /app/x-tunnel-linux -l ws://127.0.0.1:$WSPORT -token "$TOKEN"
+fi
+
+echo "[cloudflared] 启动，metrics 端口 $METRICSPORT ..."
+./cloudflared-linux update 2>/dev/null || true
+screen -dmUS argo /app/cloudflared-linux \
+    --edge-ip-version "$IPV" \
+    --protocol http2 \
+    tunnel \
+    --url "127.0.0.1:$WSPORT" \
+    --metrics "0.0.0.0:$METRICSPORT"
+
+echo "[等待] 正在等待 Cloudflare 隧道建立..."
 while true; do
-    RESP=$(curl -s "http://127.0.0.1:$METRICS_PORT/metrics")
+    RESP=$(curl -s "http://127.0.0.1:$METRICSPORT/metrics" 2>/dev/null || true)
     if echo "$RESP" | grep -q 'userHostname='; then
         DOMAIN=$(echo "$RESP" | grep 'userHostname="' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/')
-        echo "======================================"
-        echo "🚀 节点创建成功！"
-        echo "🔗 节点地址: ${DOMAIN}:443"
-        if [ -n "$TOKEN" ]; then
-            echo "🔑 身份令牌 (Token): $TOKEN"
-        fi
-        echo "======================================"
         break
-    else
-        sleep 2
     fi
+    sleep 1
 done
 
-# 4. 关键：挂起主进程，防止 Docker 容器退出
-# wait -n 会等待任何一个后台进程退出。如果有进程崩溃，容器也会随之停止，方便重启。
-wait -n
+echo "========================================"
+if [ -z "$TOKEN" ]; then
+    echo "链接: $DOMAIN:443"
+else
+    echo "链接: $DOMAIN:443"
+    echo "Token: $TOKEN"
+fi
+echo "Metrics: http://0.0.0.0:$METRICSPORT/metrics"
+echo "========================================"
+
+# 保持容器前台运行
+tail -f /dev/null

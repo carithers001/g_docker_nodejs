@@ -1,20 +1,39 @@
-# 使用轻量级的 Debian 作为基础镜像
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
-# 设置环境变量，避免 apt 安装时产生交互提示
-ENV DEBIAN_FRONTEND=noninteractive
+# 安装依赖
+RUN apt-get update && apt-get install -y \
+    curl \
+    screen \
+    lsof \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
 
-# 安装依赖工具 (curl 和 ca-certificates 用于下载和验证 HTTPS)
-RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-# 下载 amd64 架构的核心文件 (如果你的宿主机是 ARM/Mac M1，请替换下面链接中的 amd64 为 arm64)
-RUN curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-amd64 -o /usr/local/bin/x-tunnel && \
-    curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && \
-    chmod +x /usr/local/bin/x-tunnel /usr/local/bin/cloudflared
+# 根据架构下载二进制（构建时决定）
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) \
+        curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-amd64 -o x-tunnel-linux && \
+        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared-linux \
+        ;; \
+      386) \
+        curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-386 -o x-tunnel-linux && \
+        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386 -o cloudflared-linux \
+        ;; \
+      arm64) \
+        curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-arm64 -o x-tunnel-linux && \
+        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o cloudflared-linux \
+        ;; \
+      *) echo "不支持的架构: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    chmod +x x-tunnel-linux cloudflared-linux
 
-# 将启动脚本复制进容器
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
-# 设置容器启动时执行的程序
-ENTRYPOINT ["/entrypoint.sh"]
+# 环境变量（默认值）
+ENV TOKEN=""
+ENV IPV="4"
+
+ENTRYPOINT ["/app/entrypoint.sh"]
