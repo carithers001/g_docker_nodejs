@@ -20,6 +20,14 @@ WSPORT=$(get_free_port)
 # 固定 Metrics 端口以骗过 DCDeploy 健康检查
 METRICSPORT="${PORT:-8080}"
 
+# 新增：防休眠保活机制
+(
+    while true; do
+        curl -s -m 5 https://1.1.1.1 > /dev/null 2>&1 || true
+        sleep 300
+    done
+) &
+
 echo "[x-tunnel] 启动，监听本地端口 $WSPORT ..."
 # 🚀 修复 1：彻底抛弃 screen，使用原生的 & 放入后台
 if [ -z "$TOKEN" ]; then
