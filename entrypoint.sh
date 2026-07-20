@@ -17,6 +17,7 @@ HEALTH_PORT="${PORT:-8080}"
 
 # 2. x-tunnel 本地内部使用的真实端口换为 8081，避免和健康检查端口冲突
 WSPORT=8081
+UPTIME_PORT=8082 # 用于显示运行时间的本地端口
 
 # 心跳保活逻辑
 (
@@ -53,6 +54,52 @@ echo "当前健康检查端口: $HEALTH_PORT"
 echo "当前本地服务端口: $WSPORT"
 echo "========================================"
 
+# ================= 运行状态监控网页 (Uptime Web Server) =================
+START_TIME=$(date +%s)
+START_DATE=$(date "+%Y-%m-%d %H:%M:%S")
+mkdir -p /tmp/www
+
+# 后台循环：每 5 秒更新一次 index.html
+(
+    while true; do
+        NOW=$(date +%s)
+        DIFF=$((NOW - START_TIME))
+        DAYS=$((DIFF / 86400))
+        HOURS=$(( (DIFF % 86400) / 3600 ))
+        MINS=$(( (DIFF % 3600) / 60 ))
+        SECS=$((DIFF % 60))
+        
+        # 写入 HTML 文件
+        cat <<EOF > /tmp/www/index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="5"> <!-- 每5秒自动刷新网页 -->
+    <title>服务运行状态</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; margin-top: 10vh; background-color: #f4f4f9; color: #333; }
+        .box { background: white; padding: 30px 50px; border-radius: 12px; display: inline-block; box-shadow: 0 8px 16px rgba(0,0,0,0.1); }
+        .time { font-size: 28px; color: #007bff; font-weight: bold; margin: 15px 0; letter-spacing: 1px;}
+        .footer { margin-top: 20px; color: #888; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>🚀 节点运行状态正常</h2>
+        <div class="time">${DAYS}天 ${HOURS}小时 ${MINS}分钟 ${SECS}秒</div>
+        <div class="footer">本次容器启动时间：$START_DATE (北京时间)</div>
+    </div>
+</body>
+</html>
+EOF
+        sleep 60
+    done
+) &
+# 启动简易 Web 服务器
+busybox httpd -f -p $UPTIME_PORT -h /tmp/www &
+
+# ================= 指定时间定时重启逻辑 (每天 04:00) =================
 (
     # 1. 设置为你所在的时区（Asia/Shanghai 代表北京/香港时间）
     export TZ="Asia/Shanghai" 

@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     screen \
     lsof \
 	ca-certificates \
+    busybox \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
