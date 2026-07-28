@@ -12,22 +12,24 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# 根据架构下载二进制（构建时决定）
-ARG TARGETARCH
-RUN case "${TARGETARCH}" in \
-      amd64) \
-        curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-amd64 -o x-tunnel-linux && \
-        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared-linux \
-        ;; \
-      386) \
-        curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-386 -o x-tunnel-linux && \
-        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386 -o cloudflared-linux \
-        ;; \
-      arm64) \
-        curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-arm64 -o x-tunnel-linux && \
-        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o cloudflared-linux \
-        ;; \
-      *) echo "不支持的架构: ${TARGETARCH}" && exit 1 ;; \
+# 自动检测真实系统架构并下载对应文件
+RUN ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) \
+            curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-amd64 -o x-tunnel-linux && \
+            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared-linux \
+            ;; \
+        aarch64) \
+            curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-arm64 -o x-tunnel-linux && \
+            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o cloudflared-linux \
+            ;; \
+        i386 | i686) \
+            curl -L https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-386 -o x-tunnel-linux && \
+            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386 -o cloudflared-linux \
+            ;; \
+        *) \
+            echo "不支持的架构: ${ARCH}" && exit 1 \
+            ;; \
     esac && \
     chmod +x x-tunnel-linux cloudflared-linux
 
