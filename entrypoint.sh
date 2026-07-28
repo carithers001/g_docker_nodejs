@@ -46,7 +46,7 @@ echo "[cloudflared] 检查更新并启动固定隧道..."
     --edge-ip-version "$IPV" \
     --protocol http2 \
     --metrics "0.0.0.0:$HEALTH_PORT" \
-    tunnel run --token "$envToken" &
+    tunnel run --token "$ENV_TOKEN" &
 
 echo "========================================"
 echo "已连接到 Cloudflare Zero Trust (Token 硬编码模式)"
