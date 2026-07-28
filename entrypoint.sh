@@ -7,8 +7,8 @@ if [ "$IPV" != "4" ] && [ "$IPV" != "6" ]; then
 fi
 
 # 检查是否配置了 envToken 环境变量
-if [ -z "$envToken" ]; then
-    echo "[-] 致命错误: 未检测到环境变量 envToken！请在云平台设置该变量。"
+if [ -z "$ENV_TOKEN" ]; then
+    echo "[-] 致命错误: 未检测到环境变量 ENV_TOKEN！请在云平台设置该变量。"
     exit 1
 fi
 
