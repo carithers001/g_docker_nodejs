@@ -1,0 +1,6 @@
+{
+  "name": "codered-tunnel",
+  "version": "1.0.0",
+  "description": "CodeRed Tunnel App",
+  "main": "app.js"
+}
