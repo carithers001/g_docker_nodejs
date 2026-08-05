@@ -6,7 +6,7 @@ if [ "$IPV" != "4" ] && [ "$IPV" != "6" ]; then
     exit 1
 fi
 
-# 检查是否配置了 envToken 环境变量
+# 检查是否配置了 ENV_TOKEN 环境变量
 if [ -z "$ENV_TOKEN" ]; then
     echo "[-] 致命错误: 未检测到环境变量 ENV_TOKEN！请在云平台设置该变量。"
     exit 1
@@ -38,18 +38,15 @@ fi
 
 sleep 1
 
-echo "[cloudflared] 检查更新并启动固定隧道..."
-./cloudflared-linux update 2>/dev/null || true
-
-# 3. 启动 Cloudflare Tunnel，加入 --metrics 满足健康检查，并硬编码你的固定 Token
+# 3. 启动 Cloudflare Tunnel，加入 --metrics 满足健康检查
 /app/cloudflared-linux \
     --edge-ip-version "$IPV" \
     --protocol http2 \
+    --no-autoupdate \
     --metrics "0.0.0.0:$HEALTH_PORT" \
     tunnel run --token "$ENV_TOKEN" &
 
 echo "========================================"
-echo "已连接到 Cloudflare Zero Trust (Token 硬编码模式)"
 echo "当前健康检查端口: $HEALTH_PORT"
 echo "当前本地服务端口: $WSPORT"
 echo "========================================"
@@ -61,6 +58,9 @@ mkdir -p /tmp/www
 
 # 后台循环：每 5 秒更新一次 index.html
 (
+    sleep 3
+    rm -f /app/x-tunnel-linux /app/cloudflared-linux
+
     while true; do
         NOW=$(date +%s)
         DIFF=$((NOW - START_TIME))

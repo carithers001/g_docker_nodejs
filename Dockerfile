@@ -1,13 +1,14 @@
 FROM debian:bookworm-slim
 
 # 安装依赖
+ENV TZ=Asia/Shanghai
 RUN apt-get update && apt-get install -y \
     curl \
-    screen \
-    lsof \
-	ca-certificates \
+    ca-certificates \
     busybox \
+    tzdata \
     --no-install-recommends && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -34,7 +35,8 @@ RUN ARCH=$(uname -m) && \
     chmod +x x-tunnel-linux cloudflared-linux
 
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    chmod -R 777 /app
 
 # 环境变量（默认值）
 ENV TOKEN=""
