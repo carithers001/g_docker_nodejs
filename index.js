@@ -8,23 +8,33 @@ const path = require('path');
 // 支持自动处理 302 重定向
 function downloadFile(url, dest) {
     return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
         const request = url.startsWith('https') ? https : http;
         
         request.get(url, (response) => {
+            // 处理重定向 (GitHub Releases 通常会 302重定向)
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                // 处理重定向 (GitHub Releases 通常会 302重定向)
                 return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
             }
+            
+            // 状态码异常
             if (response.statusCode !== 200) {
                 return reject(new Error(`HTTP 状态码错误: ${response.statusCode}`));
             }
             
+            // 💡 只有在确认 200 OK 时，才创建文件写入流！防止重定向导致的文件句柄泄漏
+            const file = fs.createWriteStream(dest);
             response.pipe(file);
+            
             file.on('finish', () => {
-                file.close();
-                fs.chmodSync(dest, 0o755); // 赋予执行权限
-                resolve();
+                // 💡 使用 file.close() 的回调函数，确保操作系统底层彻底关闭该文件描述符
+                file.close(() => {
+                    try {
+                        fs.chmodSync(dest, 0o755); // 赋予执行权限
+                        resolve();
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
             });
         }).on('error', (err) => {
             fs.unlink(dest, () => {}); // 下载失败清理残留文件
@@ -77,7 +87,7 @@ async function startDaemon(name, url, args) {
 // ================= 3. 主初始化流程 =================
 async function init() {
     let IPV = process.env.IPV === "6" ? "6" : "4";
-    const envToken = process.env.envToken;
+    const envToken = process.env.envToken || process.env.ENV_TOKEN || process.env.token || process.env.TOKEN;
     const TOKEN = process.env.TOKEN;
 
     if (!envToken) {
@@ -107,6 +117,7 @@ async function init() {
     const cfArgs = [
         '--edge-ip-version', IPV,
         '--protocol', 'http2',
+        '--no-autoupdate',
         '--metrics', `0.0.0.0:${HEALTH_PORT}`,
         'tunnel', 'run', '--token', envToken
     ];
