@@ -3,8 +3,11 @@
 
 import asyncio
 import os
+import platform
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,10 +15,29 @@ from urllib.parse import urlsplit
 
 
 WSPORT = 8081
-HEALTH_PORT = 8082
 APP_DIRECTORY = Path(os.environ.get("APP_DIR", Path(__file__).resolve().parent))
-X_TUNNEL = APP_DIRECTORY / "x-tunnel-linux"
-CLOUDFLARED = APP_DIRECTORY / "cloudflared-linux"
+X_TUNNEL = APP_DIRECTORY / "x"
+CLOUDFLARED = APP_DIRECTORY / "c"
+DOWNLOAD_TIMEOUT_SECONDS = 60
+DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
+EXECUTABLE_FILE_MODE = 0o755
+X_TUNNEL_DOWNLOAD_BASE_URL = "https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-"
+CLOUDFLARED_DOWNLOAD_BASE_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-"
+)
+ARCHITECTURE_SUFFIXES = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "i386": "386",
+    "i686": "386",
+    "x86": "386",
+}
+
+
+class RuntimeBinaryDownloadError(RuntimeError):
+    """Raised when a required runtime binary cannot be prepared safely."""
 
 
 def configure_timezone() -> None:
@@ -24,6 +46,65 @@ def configure_timezone() -> None:
     tzset = getattr(time, "tzset", None)
     if tzset is not None:
         tzset()
+
+
+def get_architecture_suffix() -> str:
+    """Return the original Docker image asset suffix for the current Linux CPU."""
+    operating_system = platform.system()
+    if operating_system != "Linux":
+        raise RuntimeBinaryDownloadError(
+            f"不支持的操作系统: {operating_system}；仅支持 Linux 服务器。"
+        )
+
+    machine = platform.machine().lower()
+    suffix = ARCHITECTURE_SUFFIXES.get(machine)
+    if suffix is None:
+        raise RuntimeBinaryDownloadError(f"不支持的 CPU 架构: {machine}")
+    return suffix
+
+
+def download_binary(url: str, destination: Path) -> None:
+    """Download one executable atomically and make it executable for all users."""
+    temporary_path = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".download",
+            dir=destination.parent,
+        )
+        temporary_path = Path(temporary_name)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "bms-runtime-downloader"},
+        )
+
+        with os.fdopen(file_descriptor, "wb") as output_file:
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                while chunk := response.read(DOWNLOAD_CHUNK_SIZE_BYTES):
+                    output_file.write(chunk)
+
+        if temporary_path.stat().st_size == 0:
+            raise RuntimeBinaryDownloadError(f"下载 {destination.name} 失败: 文件为空")
+
+        os.chmod(temporary_path, EXECUTABLE_FILE_MODE)
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    except RuntimeBinaryDownloadError:
+        raise
+    except (OSError, urllib.error.URLError) as exc:
+        raise RuntimeBinaryDownloadError(f"下载 {destination.name} 失败: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def download_runtime_binaries() -> None:
+    """Reproduce the Dockerfile's architecture-specific runtime binary downloads."""
+    suffix = get_architecture_suffix()
+    print(f"[download] 检测到 Linux 架构: {platform.machine()}", flush=True)
+    download_binary(f"{X_TUNNEL_DOWNLOAD_BASE_URL}{suffix}", X_TUNNEL)
+    download_binary(f"{CLOUDFLARED_DOWNLOAD_BASE_URL}{suffix}", CLOUDFLARED)
 
 
 def render_status_page(start_time: float, start_date: str) -> bytes:
@@ -143,6 +224,7 @@ async def run() -> int:
     http_server = None
 
     try:
+        await asyncio.to_thread(download_runtime_binaries)
         background_tasks.append(asyncio.create_task(heartbeat_loop(), name="heartbeat"))
 
         print(f"[x-tunnel] 启动在本地端口 {WSPORT} ...", flush=True)
@@ -170,7 +252,6 @@ async def run() -> int:
         child_processes.append(cloudflared_process)
 
         print("========================================", flush=True)
-        print(f"当前健康检查端口: {HEALTH_PORT}", flush=True)
         print(f"当前本地服务端口: {WSPORT}", flush=True)
         print("========================================", flush=True)
 
@@ -200,6 +281,9 @@ async def run() -> int:
             return 1
 
         return result if isinstance(result, int) else 0
+    except RuntimeBinaryDownloadError as exc:
+        print(f"[-] {exc}", file=sys.stderr, flush=True)
+        return 1
     except FileNotFoundError as exc:
         print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
         return 1
