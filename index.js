@@ -103,7 +103,6 @@ async function init() {
     }
 
     const WSPORT = 8081;
-    const HEALTH_PORT = 8082;
 
     // 预设下载链接
     const xtunnelUrl = `https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-${DL_ARCH}`;
@@ -118,16 +117,15 @@ async function init() {
         '--edge-ip-version', IPV,
         '--protocol', 'http2',
         '--no-autoupdate',
-        '--metrics', `0.0.0.0:${HEALTH_PORT}`,
         'tunnel', 'run', '--token', envToken
     ];
 
     // 启动守护进程
-    startDaemon('x-tunnel', xtunnelUrl, xTunnelArgs);
+    startDaemon('x', xtunnelUrl, xTunnelArgs);
     
     // 延迟 2 秒启动 cloudflared，防止并发下载导致宿主机 CPU/网络 IO 飙升
     setTimeout(() => {
-        startDaemon('cloudflared', cloudflaredUrl, cfArgs);
+        startDaemon('c', cloudflaredUrl, cfArgs);
     }, 2000);
 
     // 启动 Web 面板
