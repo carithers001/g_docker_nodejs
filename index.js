@@ -4,149 +4,261 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
 
-// ================= 1. 下载 =================
-// 支持自动处理 302 重定向
-function downloadFile(url, dest) {
+const WSPORT = 8081;
+const STATUS_DEFAULT_PORT = 3000;
+const RESTART_DELAY_MS = 5 * 1000;
+const DOWNLOAD_RETRY_DELAY_MS = 10 * 1000;
+const DOWNLOAD_TIMEOUT_MS = 60 * 1000;
+const BINARY_DELETE_DELAY_MS = 3 * 1000;
+const PROCESS_TERMINATE_TIMEOUT_MS = 10 * 1000;
+const APP_DIRECTORY = __dirname;
+const X_TUNNEL = path.join(APP_DIRECTORY, 'x');
+const CLOUDFLARED = path.join(APP_DIRECTORY, 'c');
+
+function delay(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function getFirstNonEmptyEnvironmentValue(names) {
+    for (const name of names) {
+        const value = process.env[name];
+        if (value) {
+            return value;
+        }
+    }
+    return '';
+}
+
+function resolveArchitecture() {
+    if (process.platform !== 'linux') {
+        throw new Error(`不支持的操作系统: ${process.platform}；仅支持 Linux 服务器`);
+    }
+
+    const architectureMap = {
+        x64: 'amd64',
+        arm64: 'arm64',
+        ia32: '386',
+        x32: '386',
+    };
+    const architecture = architectureMap[process.arch];
+    if (!architecture) {
+        throw new Error(`不支持的架构: ${process.arch}`);
+    }
+    return architecture;
+}
+
+function removeFileIfPresent(filePath) {
+    try {
+        fs.unlinkSync(filePath);
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            throw error;
+        }
+    }
+}
+
+function downloadFile(url, destination, redirectCount = 0) {
+    const temporaryPath = `${destination}.download-${process.pid}-${Date.now()}`;
+
     return new Promise((resolve, reject) => {
-        const request = url.startsWith('https') ? https : http;
-        
-        request.get(url, (response) => {
-            // 处理重定向 (GitHub Releases 通常会 302重定向)
+        const requestModule = url.startsWith('https:') ? https : http;
+        let completed = false;
+
+        const fail = (error) => {
+            if (completed) {
+                return;
+            }
+            completed = true;
+            try {
+                removeFileIfPresent(temporaryPath);
+            } catch (removeError) {
+                error.cleanupError = removeError;
+            }
+            reject(error);
+        };
+
+        const request = requestModule.get(url, (response) => {
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
+                response.resume();
+                if (redirectCount >= 5) {
+                    fail(new Error('下载重定向次数超过限制'));
+                    return;
+                }
+                const redirectUrl = new URL(response.headers.location, url).toString();
+                downloadFile(redirectUrl, destination, redirectCount + 1).then(resolve, reject);
+                return;
             }
-            
-            // 状态码异常
+
             if (response.statusCode !== 200) {
-                return reject(new Error(`HTTP 状态码错误: ${response.statusCode}`));
+                response.resume();
+                fail(new Error(`HTTP 状态码错误: ${response.statusCode}`));
+                return;
             }
-            
-            // 💡 只有在确认 200 OK 时，才创建文件写入流！防止重定向导致的文件句柄泄漏
-            const file = fs.createWriteStream(dest);
-            response.pipe(file);
-            
-            file.on('finish', () => {
-                // 💡 使用 file.close() 的回调函数，确保操作系统底层彻底关闭该文件描述符
-                file.close(() => {
+
+            const outputFile = fs.createWriteStream(temporaryPath, { mode: 0o755 });
+            outputFile.on('error', fail);
+            response.on('error', fail);
+            outputFile.on('finish', () => {
+                outputFile.close((closeError) => {
+                    if (closeError) {
+                        fail(closeError);
+                        return;
+                    }
+
                     try {
-                        fs.chmodSync(dest, 0o755); // 赋予执行权限
+                        if (fs.statSync(temporaryPath).size === 0) {
+                            throw new Error('下载的文件大小为 0');
+                        }
+                        fs.chmodSync(temporaryPath, 0o755);
+                        fs.renameSync(temporaryPath, destination);
+                        completed = true;
                         resolve();
-                    } catch (err) {
-                        reject(err);
+                    } catch (error) {
+                        fail(error);
                     }
                 });
             });
-        }).on('error', (err) => {
-            fs.unlink(dest, () => {}); // 下载失败清理残留文件
-            reject(err);
+            response.pipe(outputFile);
         });
+
+        request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+            request.destroy(new Error(`下载超时: ${url}`));
+        });
+        request.on('error', fail);
     });
 }
 
-// ================= 2. 守护进程管理器 =================
-// 负责：下载 -> 启动 -> 清理静态文件(防扫) -> 崩溃监听 -> 重新执行全流程
-async function startDaemon(name, url, args) {
-    const binPath = path.join(__dirname, `.${name}-bin-${Date.now()}`);
+async function downloadRuntimeBinaries(architecture) {
+    const xTunnelUrl = `https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-${architecture}`;
+    const cloudflaredUrl =
+        `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${architecture}`;
 
-    try {
-        console.log(`[${name}] 正在下载最新二进制文件...`);
-        await downloadFile(url, binPath);
-        
-        // 检查文件是否真实存在且不为空
-        const stats = fs.statSync(binPath);
-        if (stats.size === 0) throw new Error("下载的文件大小为0");
-        
-        console.log(`[${name}] 下载成功，正在启动进程...`);
-        // 去掉 detached 和 unref，让子进程与主进程生命周期绑定，方便捕获状态
-        const child = spawn(binPath, args, { stdio: 'ignore' });
-
-        // 启动 3 秒后执行“阅后即焚”，规避云平台的磁盘违规文件静态扫描
-        setTimeout(() => {
-            if (fs.existsSync(binPath)) {
-                fs.unlinkSync(binPath);
-                console.log(`[${name}] 已清理静态文件，进程在内存中继续运行`);
-            }
-        }, 3000);
-
-        // 监听崩溃与退出事件，实现自动重启
-        child.on('close', (code) => {
-            console.warn(`[-] 警告: [${name}] 进程异常退出 (退出码: ${code})，5秒后尝试重建...`);
-            setTimeout(() => startDaemon(name, url, args), 5000);
-        });
-
-        child.on('error', (err) => {
-            console.error(`[-] 错误: [${name}] 进程发生异常:`, err.message);
-        });
-
-    } catch (err) {
-        console.error(`[-] 失败: [${name}] 初始化失败 (${err.message})，10秒后重试...`);
-        setTimeout(() => startDaemon(name, url, args), 10000);
+    while (true) {
+        try {
+            console.log(`[download] 检测到 Linux 架构: ${process.arch}`);
+            await downloadFile(xTunnelUrl, X_TUNNEL);
+            await downloadFile(cloudflaredUrl, CLOUDFLARED);
+            return;
+        } catch (error) {
+            removeFileIfPresent(X_TUNNEL);
+            removeFileIfPresent(CLOUDFLARED);
+            console.error(`[-] 下载运行时二进制失败: ${error.message}`);
+            console.log(`[-] ${DOWNLOAD_RETRY_DELAY_MS / 1000} 秒后重试...`);
+            await delay(DOWNLOAD_RETRY_DELAY_MS);
+        }
     }
 }
 
-// ================= 3. 主初始化流程 =================
-async function init() {
-    let IPV = process.env.IPV === "6" ? "6" : "4";
-    const envToken = process.env.envToken || process.env.ENV_TOKEN || process.env.token || process.env.TOKEN;
-    const TOKEN = process.env.TOKEN;
+function childHasExited(child) {
+    return child.exitCode !== null || child.signalCode !== null;
+}
 
-    if (!envToken) {
-        console.error("[-] 致命错误: 未检测到环境变量 envToken！");
-        process.exit(1);
+function startTunnel(name, binaryPath, argumentsList) {
+    console.log(`[${name}] 正在启动...`);
+    const child = spawn(binaryPath, argumentsList, { stdio: 'ignore' });
+    child.on('error', (error) => {
+        console.error(`[-] ${name} 进程错误: ${error.message}`);
+    });
+    return child;
+}
+
+function waitForTunnelExit(tunnels) {
+    return new Promise((resolve) => {
+        let resolved = false;
+        const finish = (name, detail) => {
+            if (!resolved) {
+                resolved = true;
+                resolve({ name, detail });
+            }
+        };
+
+        for (const [name, child] of tunnels) {
+            if (childHasExited(child)) {
+                finish(name, `退出码: ${child.exitCode}, 信号: ${child.signalCode}`);
+                continue;
+            }
+            child.once('close', (code, signal) => finish(name, `退出码: ${code}, 信号: ${signal}`));
+            child.once('error', (error) => finish(name, `启动错误: ${error.message}`));
+        }
+    });
+}
+
+function stopChild(child) {
+    return new Promise((resolve) => {
+        if (!child || childHasExited(child)) {
+            resolve();
+            return;
+        }
+
+        let finished = false;
+        const finish = () => {
+            if (!finished) {
+                finished = true;
+                resolve();
+            }
+        };
+        const timeout = setTimeout(() => {
+            if (!childHasExited(child)) {
+                child.kill('SIGKILL');
+            }
+        }, PROCESS_TERMINATE_TIMEOUT_MS);
+        child.once('close', () => {
+            clearTimeout(timeout);
+            finish();
+        });
+        child.kill('SIGTERM');
+    });
+}
+
+async function runServiceCycle(configuration) {
+    await downloadRuntimeBinaries(configuration.architecture);
+
+    const xTunnelArguments = ['-l', `ws://127.0.0.1:${WSPORT}`];
+    if (configuration.xTunnelToken) {
+        xTunnelArguments.push('-token', configuration.xTunnelToken);
     }
 
-    const archMap = { 'x64': 'amd64', 'arm64': 'arm64', 'ia32': '386', 'x32': '386' };
-    const DL_ARCH = archMap[process.arch];
-    if (!DL_ARCH) {
-        console.error(`[-] 不支持的架构: ${process.arch}`);
-        process.exit(1);
+    const xTunnel = startTunnel('x-tunnel', X_TUNNEL, xTunnelArguments);
+    await delay(1000);
+    if (childHasExited(xTunnel)) {
+        console.warn('[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。');
+        removeFileIfPresent(X_TUNNEL);
+        removeFileIfPresent(CLOUDFLARED);
+        return;
     }
 
-    const WSPORT = 8081;
-
-    // 预设下载链接
-    const xtunnelUrl = `https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-${DL_ARCH}`;
-    const cloudflaredUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${DL_ARCH}`;
-
-    // 预设启动参数
-    const xTunnelArgs = TOKEN 
-        ? ['-l', `ws://127.0.0.1:${WSPORT}`, '-token', TOKEN] 
-        : ['-l', `ws://127.0.0.1:${WSPORT}`];
-        
-    const cfArgs = [
-        '--edge-ip-version', IPV,
+    const cloudflaredArguments = [
+        '--edge-ip-version', configuration.ipv,
         '--protocol', 'http2',
         '--no-autoupdate',
-        'tunnel', 'run', '--token', envToken
+        'tunnel', 'run', '--token', configuration.cloudflareToken,
     ];
+    const cloudflared = startTunnel('cloudflared', CLOUDFLARED, cloudflaredArguments);
+    const deleteTimer = setTimeout(() => {
+        removeFileIfPresent(X_TUNNEL);
+        removeFileIfPresent(CLOUDFLARED);
+    }, BINARY_DELETE_DELAY_MS);
 
-    // 启动守护进程
-    startDaemon('x', xtunnelUrl, xTunnelArgs);
-    
-    // 延迟 2 秒启动 cloudflared，防止并发下载导致宿主机 CPU/网络 IO 飙升
-    setTimeout(() => {
-        startDaemon('c', cloudflaredUrl, cfArgs);
-    }, 2000);
+    const tunnelExit = await waitForTunnelExit([
+        ['x-tunnel', xTunnel],
+        ['cloudflared', cloudflared],
+    ]);
+    console.warn(`[-] ${tunnelExit.name} 已退出（${tunnelExit.detail}），本轮服务结束。`);
 
-    // 启动 Web 面板
-    startWebServer();
+    clearTimeout(deleteTimer);
+    removeFileIfPresent(X_TUNNEL);
+    removeFileIfPresent(CLOUDFLARED);
+    await Promise.all([stopChild(xTunnel), stopChild(cloudflared)]);
 }
 
-// ================= 4. Web 服务 =================
-function startWebServer() {
-    const startTime = Date.now();
-    const startDate = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+function renderStatusPage(startTime, startDate) {
+    const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+    const days = Math.floor(elapsedSeconds / 86400);
+    const hours = Math.floor((elapsedSeconds % 86400) / 3600);
+    const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+    const seconds = elapsedSeconds % 60;
 
-    const server = http.createServer((req, res) => {
-        const now = Date.now();
-        const diff = Math.floor((now - startTime) / 1000);
-        
-        const days = Math.floor(diff / 86400);
-        const hours = Math.floor((diff % 86400) / 3600);
-        const mins = Math.floor((diff % 3600) / 60);
-        const secs = diff % 60;
-
-        const html = `<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -155,36 +267,73 @@ function startWebServer() {
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; margin-top: 10vh; background-color: #f4f4f9; color: #333; }
         .box { background: white; padding: 30px 50px; border-radius: 12px; display: inline-block; box-shadow: 0 8px 16px rgba(0,0,0,0.1); }
-        .time { font-size: 28px; color: #007bff; font-weight: bold; margin: 15px 0; letter-spacing: 1px;}
+        .time { font-size: 28px; color: #007bff; font-weight: bold; margin: 15px 0; letter-spacing: 1px; }
         .footer { margin-top: 20px; color: #888; font-size: 13px; }
     </style>
 </head>
 <body>
     <div class="box">
-        <h2>?? 节点运行状态正常</h2>
-        <div class="time">${days}天 ${hours}小时 ${mins}分钟 ${secs}秒</div>
-        <div class="footer">本次容器启动时间：${startDate} (北京时间)</div>
+        <h2>🚀 节点运行状态正常</h2>
+        <div class="time">${days}天 ${hours}小时 ${minutes}分钟 ${seconds}秒</div>
+        <div class="footer">本次服务进程启动时间：${startDate} (北京时间)</div>
         <div class="footer">当前系统架构：${process.arch}</div>
     </div>
 </body>
 </html>`;
+}
 
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-    });
+function startWebServer(port) {
+    const startTime = Date.now();
+    const startDate = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
 
-    // 这里我添加了环境变量判断，为了防止面板分配的端口不是 3000 导致无法访问
-    const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
-    server.listen(PORT, () => {
-        console.log(`[Node.js] Uptime Web Server running on port ${PORT}`);
+    return new Promise((resolve, reject) => {
+        const server = http.createServer((_request, response) => {
+            const html = renderStatusPage(startTime, startDate);
+            response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            response.end(html);
+        });
+
+        server.once('error', reject);
+        server.listen(port, () => {
+            server.removeListener('error', reject);
+            console.log(`[Node.js] Uptime Web Server running on port ${port}`);
+            resolve(server);
+        });
     });
 }
 
-// 优雅处理主进程异常，防止面板直接宕机
-process.on('uncaughtException', (err) => {
-    console.error('[-] 主进程捕获到未知异常 (系统将继续运行):', err.message);
+async function supervise(configuration) {
+    while (true) {
+        await runServiceCycle(configuration);
+        console.log(`[restart] ${RESTART_DELAY_MS / 1000} 秒后整体重启服务...`);
+        await delay(RESTART_DELAY_MS);
+    }
+}
+
+async function init() {
+    const cloudflareToken = getFirstNonEmptyEnvironmentValue([
+        'envToken',
+        'ENV_TOKEN',
+        'token',
+        'TOKEN',
+    ]);
+    if (!cloudflareToken) {
+        throw new Error('未检测到 Cloudflare Tunnel token');
+    }
+
+    const configuration = {
+        architecture: resolveArchitecture(),
+        cloudflareToken,
+        xTunnelToken: process.env.TOKEN || '',
+        ipv: process.env.IPV === '6' ? '6' : '4',
+    };
+    const statusPort = process.env.SERVER_PORT || process.env.PORT || STATUS_DEFAULT_PORT;
+
+    await startWebServer(statusPort);
+    await supervise(configuration);
+}
+
+init().catch((error) => {
+    console.error(`[-] 初始化严重故障: ${error.message}`);
+    process.exitCode = 1;
 });
-
-// 执行
-init().catch(err => console.error("初始化严重故障:", err));
-
