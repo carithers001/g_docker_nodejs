@@ -15,6 +15,9 @@ from urllib.parse import urlsplit
 
 
 WSPORT = 8081
+STATUS_DEFAULT_PORT = 3000
+RESTART_DELAY_SECONDS = 5
+DOWNLOAD_RETRY_DELAY_SECONDS = 10
 APP_DIRECTORY = Path(os.environ.get("APP_DIR", Path(__file__).resolve().parent))
 X_TUNNEL = APP_DIRECTORY / "x"
 CLOUDFLARED = APP_DIRECTORY / "c"
@@ -34,6 +37,7 @@ ARCHITECTURE_SUFFIXES = {
     "i686": "386",
     "x86": "386",
 }
+CLOUDFLARE_TOKEN_ENVIRONMENT_NAMES = ("envToken", "ENV_TOKEN", "token", "TOKEN")
 
 
 class RuntimeBinaryDownloadError(RuntimeError):
@@ -61,6 +65,30 @@ def get_architecture_suffix() -> str:
     if suffix is None:
         raise RuntimeBinaryDownloadError(f"不支持的 CPU 架构: {machine}")
     return suffix
+
+
+def get_cloudflare_token() -> str:
+    """Return the first configured Cloudflare token using the JS branch's aliases."""
+    for environment_name in CLOUDFLARE_TOKEN_ENVIRONMENT_NAMES:
+        token = os.environ.get(environment_name, "")
+        if token:
+            return token
+    return ""
+
+
+def get_ipv() -> str:
+    """Keep the JS branch behavior: only an explicit 6 selects IPv6."""
+    return "6" if os.environ.get("IPV") == "6" else "4"
+
+
+def get_status_port() -> int:
+    """Use the JS branch's SERVER_PORT, PORT, then 3000 precedence."""
+    configured_port = (
+        os.environ.get("SERVER_PORT")
+        or os.environ.get("PORT")
+        or str(STATUS_DEFAULT_PORT)
+    )
+    return int(configured_port)
 
 
 def download_binary(url: str, destination: Path) -> None:
@@ -99,12 +127,16 @@ def download_binary(url: str, destination: Path) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def download_runtime_binaries() -> None:
+def download_runtime_binaries(architecture_suffix: str) -> None:
     """Reproduce the Dockerfile's architecture-specific runtime binary downloads."""
-    suffix = get_architecture_suffix()
     print(f"[download] 检测到 Linux 架构: {platform.machine()}", flush=True)
-    download_binary(f"{X_TUNNEL_DOWNLOAD_BASE_URL}{suffix}", X_TUNNEL)
-    download_binary(f"{CLOUDFLARED_DOWNLOAD_BASE_URL}{suffix}", CLOUDFLARED)
+    try:
+        download_binary(f"{X_TUNNEL_DOWNLOAD_BASE_URL}{architecture_suffix}", X_TUNNEL)
+        download_binary(f"{CLOUDFLARED_DOWNLOAD_BASE_URL}{architecture_suffix}", CLOUDFLARED)
+    except RuntimeBinaryDownloadError:
+        X_TUNNEL.unlink(missing_ok=True)
+        CLOUDFLARED.unlink(missing_ok=True)
+        raise
 
 
 def render_status_page(start_time: float, start_date: str) -> bytes:
@@ -137,21 +169,6 @@ def render_status_page(start_time: float, start_date: str) -> bytes:
 </html>
 """
     return content.encode("utf-8")
-
-
-def heartbeat_request() -> None:
-    try:
-        with urllib.request.urlopen("https://1.1.1.1", timeout=5):
-            pass
-    except Exception:
-        # Keep the shell script's "curl ... || true" behavior.
-        pass
-
-
-async def heartbeat_loop() -> None:
-    while True:
-        await asyncio.to_thread(heartbeat_request)
-        await asyncio.sleep(300)
 
 
 async def remove_runtime_binaries() -> None:
@@ -197,25 +214,13 @@ async def terminate_process(process: asyncio.subprocess.Process) -> None:
             await process.wait()
 
 
-async def run() -> int:
-    configure_timezone()
-
-    ipv = os.environ.get("IPV", "4")
-    if ipv not in ("4", "6"):
-        print(f"[-] IPV 参数错误 : {ipv}", flush=True)
-        return 1
-
-    env_token = os.environ.get("ENV_TOKEN", "")
-    if not env_token:
-        print("[-] 致命错误: 未检测到环境变量 ENV_TOKEN！请在云平台设置该变量。", flush=True)
-        return 1
-
-    try:
-        uptime_port = int(os.environ.get("PORT", "8080"))
-    except ValueError:
-        print(f"[-] PORT 参数错误 : {os.environ.get('PORT', '')}", flush=True)
-        return 1
-
+async def run_service_cycle(
+    ipv: str,
+    cloudflare_token: str,
+    uptime_port: int,
+    architecture_suffix: str,
+) -> int:
+    """Run one complete tunnel service cycle until a monitored task exits."""
     start_time = time.time()
     start_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
 
@@ -224,8 +229,7 @@ async def run() -> int:
     http_server = None
 
     try:
-        await asyncio.to_thread(download_runtime_binaries)
-        background_tasks.append(asyncio.create_task(heartbeat_loop(), name="heartbeat"))
+        await asyncio.to_thread(download_runtime_binaries, architecture_suffix)
 
         print(f"[x-tunnel] 启动在本地端口 {WSPORT} ...", flush=True)
         x_tunnel_args = [str(X_TUNNEL), "-l", f"ws://127.0.0.1:{WSPORT}"]
@@ -236,6 +240,9 @@ async def run() -> int:
         child_processes.append(x_tunnel_process)
 
         await asyncio.sleep(1)
+        if x_tunnel_process.returncode is not None:
+            print("[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。", flush=True)
+            return x_tunnel_process.returncode or 1
 
         cloudflared_process = await asyncio.create_subprocess_exec(
             str(CLOUDFLARED),
@@ -247,12 +254,13 @@ async def run() -> int:
             "tunnel",
             "run",
             "--token",
-            env_token,
+            cloudflare_token,
         )
         child_processes.append(cloudflared_process)
 
         print("========================================", flush=True)
         print(f"当前本地服务端口: {WSPORT}", flush=True)
+        print(f"当前状态页端口: {uptime_port}", flush=True)
         print("========================================", flush=True)
 
         background_tasks.append(
@@ -281,15 +289,6 @@ async def run() -> int:
             return 1
 
         return result if isinstance(result, int) else 0
-    except RuntimeBinaryDownloadError as exc:
-        print(f"[-] {exc}", file=sys.stderr, flush=True)
-        return 1
-    except FileNotFoundError as exc:
-        print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
-        return 1
-    except OSError as exc:
-        print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
-        return 1
     finally:
         if http_server is not None:
             http_server.shutdown()
@@ -306,9 +305,57 @@ async def run() -> int:
         )
 
 
+async def supervise() -> int:
+    """Restart complete service cycles after tunnel exits or recoverable failures."""
+    configure_timezone()
+
+    try:
+        architecture_suffix = get_architecture_suffix()
+    except RuntimeBinaryDownloadError as exc:
+        print(f"[-] {exc}", file=sys.stderr, flush=True)
+        return 1
+
+    cloudflare_token = get_cloudflare_token()
+    if not cloudflare_token:
+        print("[-] 致命错误: 未检测到 Cloudflare Tunnel token！", flush=True)
+        return 1
+
+    try:
+        uptime_port = get_status_port()
+    except ValueError:
+        configured_port = os.environ.get("SERVER_PORT") or os.environ.get("PORT") or ""
+        print(f"[-] 状态页端口参数错误: {configured_port}", flush=True)
+        return 1
+
+    ipv = get_ipv()
+    while True:
+        try:
+            await run_service_cycle(
+                ipv,
+                cloudflare_token,
+                uptime_port,
+                architecture_suffix,
+            )
+        except RuntimeBinaryDownloadError as exc:
+            print(f"[-] {exc}", file=sys.stderr, flush=True)
+            print(
+                f"[retry] {DOWNLOAD_RETRY_DELAY_SECONDS} 秒后重试下载...",
+                flush=True,
+            )
+            await asyncio.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+            continue
+        except FileNotFoundError as exc:
+            print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
+        except OSError as exc:
+            print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
+
+        print(f"[restart] {RESTART_DELAY_SECONDS} 秒后整体重启服务...", flush=True)
+        await asyncio.sleep(RESTART_DELAY_SECONDS)
+
+
 def main() -> int:
     try:
-        return asyncio.run(run())
+        return asyncio.run(supervise())
     except KeyboardInterrupt:
         return 130
 
