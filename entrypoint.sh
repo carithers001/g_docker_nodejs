@@ -6,12 +6,6 @@ if [ "$IPV" != "4" ] && [ "$IPV" != "6" ]; then
     exit 1
 fi
 
-# 检查是否配置了 envToken 环境变量
-if [ -z "$envToken" ]; then
-    echo "[-] 致命错误: 未检测到环境变量 envToken！请在云平台设置该变量。"
-    exit 1
-fi
-
 # 1. 设置给云平台健康检查用的对外端口 (通常平台会自动分配 PORT 变量，默认 8080)
 HEALTH_PORT="${PORT:-8080}"
 
@@ -27,32 +21,7 @@ UPTIME_PORT=8082 # 用于显示运行时间的本地端口
     done
 ) &
 
-echo "[x-tunnel] 启动在本地端口 $WSPORT ..."
-
-# 启动 x-tunnel 进程
-if [ -z "$TOKEN" ]; then
-    /app/x-tunnel-linux -l ws://127.0.0.1:$WSPORT &
-else
-    /app/x-tunnel-linux -l ws://127.0.0.1:$WSPORT -token "$TOKEN" &
-fi
-
 sleep 1
-
-echo "[cloudflared] 检查更新并启动固定隧道..."
-./cloudflared-linux update 2>/dev/null || true
-
-# 3. 启动 Cloudflare Tunnel，加入 --metrics 满足健康检查，并硬编码你的固定 Token
-/app/cloudflared-linux \
-    --edge-ip-version "$IPV" \
-    --protocol http2 \
-    --metrics "0.0.0.0:$HEALTH_PORT" \
-    tunnel run --token "$envToken" &
-
-echo "========================================"
-echo "已连接到 Cloudflare Zero Trust (Token 硬编码模式)"
-echo "当前健康检查端口: $HEALTH_PORT"
-echo "当前本地服务端口: $WSPORT"
-echo "========================================"
 
 # ================= 运行状态监控网页 (Uptime Web Server) =================
 START_TIME=$(date +%s)
