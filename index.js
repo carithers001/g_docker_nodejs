@@ -14,8 +14,8 @@ const PROCESS_TERMINATE_TIMEOUT_MS = 10 * 1000;
 const FALLBACK_CLOUDFLARE_TOKEN_ENVIRONMENT_NAME = 'CLOUDFLARE_FALLBACK_TOKEN';
 const FALLBACK_TOKEN_RUNTIME_MS = 10 * 60 * 1000;
 const APP_DIRECTORY = __dirname;
-const X_TUNNEL = path.join(APP_DIRECTORY, 'x');
-const CLOUDFLARED = path.join(APP_DIRECTORY, 'c');
+const X_TUNNEL = path.join(APP_DIRECTORY, 'xxx');
+const CLOUDFLARED = path.join(APP_DIRECTORY, 'ccc');
 
 function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -305,9 +305,9 @@ function renderStatusPage(startTime, startDate) {
 </head>
 <body>
     <div class="box">
-        <h2>🚀 节点运行状态正常</h2>
+        <h2>服务器运行状态正常</h2>
         <div class="time">${days}天 ${hours}小时 ${minutes}分钟 ${seconds}秒</div>
-        <div class="footer">本次服务进程启动时间：${startDate} (北京时间)</div>
+        <div class="footer">本次服务周期启动时间：${startDate} (北京时间)</div>
         <div class="footer">当前系统架构：${process.arch}</div>
     </div>
 </body>
