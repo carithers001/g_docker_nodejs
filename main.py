@@ -19,8 +19,8 @@ STATUS_DEFAULT_PORT = 3000
 RESTART_DELAY_SECONDS = 60
 DOWNLOAD_RETRY_DELAY_SECONDS = 120
 APP_DIRECTORY = Path(os.environ.get("APP_DIR", Path(__file__).resolve().parent))
-X_TUNNEL = APP_DIRECTORY / "x"
-CLOUDFLARED = APP_DIRECTORY / "c"
+X_TUNNEL = APP_DIRECTORY / "xxx"
+CLOUDFLARED = APP_DIRECTORY / "ccc"
 DOWNLOAD_TIMEOUT_SECONDS = 60
 DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 EXECUTABLE_FILE_MODE = 0o755
@@ -175,9 +175,9 @@ def render_status_page(start_time: float, start_date: str) -> bytes:
 </head>
 <body>
     <div class="box">
-        <h2>🚀 节点运行状态正常</h2>
+        <h2>服务器运行状态正常</h2>
         <div class="time">{days}天 {hours}小时 {minutes}分钟 {seconds}秒</div>
-        <div class="footer">本次容器启动时间：{start_date} (北京时间)</div>
+        <div class="footer">本次服务周期启动时间：{start_date} (北京时间)</div>
     </div>
 </body>
 </html>
