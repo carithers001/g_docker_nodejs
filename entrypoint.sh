@@ -7,10 +7,14 @@ X_TUNNEL="$APP_DIRECTORY/x"
 CLOUDFLARED="$APP_DIRECTORY/c"
 RESTART_DELAY_SECONDS="${RESTART_DELAY_SECONDS:-5}"
 DOWNLOAD_RETRY_DELAY_SECONDS="${DOWNLOAD_RETRY_DELAY_SECONDS:-10}"
+FALLBACK_TOKEN_RUNTIME_SECONDS=600
+FALLBACK_TERMINATION_GRACE_SECONDS=10
 X_TUNNEL_PID=""
 CLOUDFLARED_PID=""
 STATUS_UPDATER_PID=""
 HTTP_SERVER_PID=""
+FALLBACK_TIMER_PID=""
+USING_FALLBACK_CLOUDFLARE_TOKEN=0
 
 if [ "${IPV:-4}" = "6" ]; then
     IPV="6"
@@ -22,8 +26,14 @@ fi
 CLOUDFLARE_TOKEN="${envToken:-${ENV_TOKEN:-${token:-${TOKEN:-}}}}"
 X_TUNNEL_TOKEN="${TOKEN:-}"
 if [ -z "$CLOUDFLARE_TOKEN" ]; then
-    echo "[-] 致命错误: 未检测到 Cloudflare Tunnel token！"
-    exit 1
+    CLOUDFLARE_TOKEN="${CLOUDFLARE_FALLBACK_TOKEN:-}"
+    if [ -n "$CLOUDFLARE_TOKEN" ]; then
+        USING_FALLBACK_CLOUDFLARE_TOKEN=1
+        echo "[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。"
+    else
+        echo "[-] 致命错误: 未检测到 Cloudflare Tunnel token！"
+        exit 1
+    fi
 fi
 
 UPTIME_PORT="${SERVER_PORT:-${PORT:-3000}}"
@@ -124,12 +134,50 @@ terminate_process() {
     fi
 }
 
+force_terminate_process() {
+    local process_id="$1"
+    if [ -n "$process_id" ] && kill -0 "$process_id" 2>/dev/null; then
+        kill -KILL "$process_id" 2>/dev/null || true
+    fi
+}
+
+stop_tunnels_for_fallback_timeout() {
+    local elapsed_seconds=0
+
+    terminate_process "$X_TUNNEL_PID"
+    terminate_process "$CLOUDFLARED_PID"
+
+    while kill -0 "$X_TUNNEL_PID" 2>/dev/null || kill -0 "$CLOUDFLARED_PID" 2>/dev/null; do
+        if [ "$elapsed_seconds" -ge "$FALLBACK_TERMINATION_GRACE_SECONDS" ]; then
+            force_terminate_process "$X_TUNNEL_PID"
+            force_terminate_process "$CLOUDFLARED_PID"
+            break
+        fi
+
+        sleep 1
+        elapsed_seconds=$((elapsed_seconds + 1))
+    done
+}
+
+start_fallback_timer() {
+    if [ "$USING_FALLBACK_CLOUDFLARE_TOKEN" -ne 1 ]; then
+        return
+    fi
+
+    (
+        sleep "$FALLBACK_TOKEN_RUNTIME_SECONDS"
+    ) &
+    FALLBACK_TIMER_PID=$!
+}
+
 cleanup_service_cycle() {
+    terminate_process "$FALLBACK_TIMER_PID"
     terminate_process "$STATUS_UPDATER_PID"
     terminate_process "$HTTP_SERVER_PID"
     terminate_process "$X_TUNNEL_PID"
     terminate_process "$CLOUDFLARED_PID"
 
+    wait "$FALLBACK_TIMER_PID" 2>/dev/null || true
     wait "$STATUS_UPDATER_PID" 2>/dev/null || true
     wait "$HTTP_SERVER_PID" 2>/dev/null || true
     wait "$X_TUNNEL_PID" 2>/dev/null || true
@@ -140,6 +188,7 @@ cleanup_service_cycle() {
     CLOUDFLARED_PID=""
     STATUS_UPDATER_PID=""
     HTTP_SERVER_PID=""
+    FALLBACK_TIMER_PID=""
 }
 
 run_service_cycle() {
@@ -170,6 +219,7 @@ run_service_cycle() {
         --no-autoupdate \
         tunnel run --token "$CLOUDFLARE_TOKEN" &
     CLOUDFLARED_PID=$!
+    start_fallback_timer
 
     echo "========================================"
     echo "当前本地服务端口: $WSPORT"
@@ -189,15 +239,33 @@ run_service_cycle() {
     busybox httpd -f -p "$UPTIME_PORT" -h /tmp/www &
     HTTP_SERVER_PID=$!
 
-    # 只等待两个隧道；任一退出均结束本轮服务，外层统一重启全部组件。
-    wait -n "$X_TUNNEL_PID" "$CLOUDFLARED_PID"
+    # 回退 Token 模式将限时器一并等待；普通模式仍只等待两个隧道。
+    local completed_pid=""
+    if [ "$USING_FALLBACK_CLOUDFLARE_TOKEN" -eq 1 ]; then
+        wait -n -p completed_pid "$X_TUNNEL_PID" "$CLOUDFLARED_PID" "$FALLBACK_TIMER_PID"
+    else
+        wait -n "$X_TUNNEL_PID" "$CLOUDFLARED_PID"
+    fi
     local tunnel_exit_code=$?
+
+    if [ "$USING_FALLBACK_CLOUDFLARE_TOKEN" -eq 1 ] && [ "$completed_pid" = "$FALLBACK_TIMER_PID" ]; then
+        echo "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared 和 x-tunnel。"
+        stop_tunnels_for_fallback_timeout
+        cleanup_service_cycle
+        return 0
+    fi
+
     echo "[-] 隧道进程已退出，本轮服务结束。"
     cleanup_service_cycle
     return "$tunnel_exit_code"
 }
 
 trap 'cleanup_service_cycle; exit 0' INT TERM
+
+if [ "$USING_FALLBACK_CLOUDFLARE_TOKEN" -eq 1 ]; then
+    run_service_cycle
+    exit $?
+fi
 
 while true; do
     run_service_cycle
