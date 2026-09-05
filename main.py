@@ -38,6 +38,8 @@ ARCHITECTURE_SUFFIXES = {
     "x86": "386",
 }
 CLOUDFLARE_TOKEN_ENVIRONMENT_NAMES = ("envToken", "ENV_TOKEN", "token", "TOKEN")
+FALLBACK_CLOUDFLARE_TOKEN_ENVIRONMENT_NAME = "CLOUDFLARE_FALLBACK_TOKEN"
+FALLBACK_TOKEN_RUNTIME_SECONDS = 600
 
 
 class RuntimeBinaryDownloadError(RuntimeError):
@@ -74,6 +76,18 @@ def get_cloudflare_token() -> str:
         if token:
             return token
     return ""
+
+
+def get_cloudflare_token_with_mode() -> tuple[str, bool]:
+    """Return an external token first, otherwise a time-limited fallback token."""
+    token = get_cloudflare_token()
+    if token:
+        return token, False
+
+    fallback_token = os.environ.get(FALLBACK_CLOUDFLARE_TOKEN_ENVIRONMENT_NAME, "")
+    if fallback_token:
+        return fallback_token, True
+    return "", False
 
 
 def get_ipv() -> str:
@@ -219,13 +233,15 @@ async def run_service_cycle(
     cloudflare_token: str,
     uptime_port: int,
     architecture_suffix: str,
-) -> int:
+    using_fallback_token: bool = False,
+) -> tuple[int, bool]:
     """Run one complete tunnel service cycle until a monitored task exits."""
     start_time = time.time()
     start_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
 
     child_processes = []
     background_tasks = []
+    fallback_timeout_task = None
     http_server = None
 
     try:
@@ -242,7 +258,7 @@ async def run_service_cycle(
         await asyncio.sleep(1)
         if x_tunnel_process.returncode is not None:
             print("[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。", flush=True)
-            return x_tunnel_process.returncode or 1
+            return x_tunnel_process.returncode or 1, False
 
         cloudflared_process = await asyncio.create_subprocess_exec(
             str(CLOUDFLARED),
@@ -257,6 +273,13 @@ async def run_service_cycle(
             cloudflare_token,
         )
         child_processes.append(cloudflared_process)
+
+        if using_fallback_token:
+            fallback_timeout_task = asyncio.create_task(
+                asyncio.sleep(FALLBACK_TOKEN_RUNTIME_SECONDS),
+                name="fallback-token-timeout",
+            )
+            background_tasks.append(fallback_timeout_task)
 
         print("========================================", flush=True)
         print(f"当前本地服务端口: {WSPORT}", flush=True)
@@ -280,15 +303,23 @@ async def run_service_cycle(
         ]
         monitored = [*background_tasks, *process_waiters]
         completed, _ = await asyncio.wait(monitored, return_when=asyncio.FIRST_COMPLETED)
+
+        if fallback_timeout_task is not None and fallback_timeout_task in completed:
+            print(
+                "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared 和 x-tunnel。",
+                flush=True,
+            )
+            return 0, True
+
         first_completed = next(iter(completed))
 
         try:
             result = first_completed.result()
         except Exception as exc:
             print(f"[-] 后台任务异常退出: {exc}", file=sys.stderr, flush=True)
-            return 1
+            return 1, False
 
-        return result if isinstance(result, int) else 0
+        return result if isinstance(result, int) else 0, False
     finally:
         if http_server is not None:
             http_server.shutdown()
@@ -315,10 +346,13 @@ async def supervise() -> int:
         print(f"[-] {exc}", file=sys.stderr, flush=True)
         return 1
 
-    cloudflare_token = get_cloudflare_token()
+    cloudflare_token, using_fallback_token = get_cloudflare_token_with_mode()
     if not cloudflare_token:
         print("[-] 致命错误: 未检测到 Cloudflare Tunnel token！", flush=True)
         return 1
+
+    if using_fallback_token:
+        print("[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。", flush=True)
 
     try:
         uptime_port = get_status_port()
@@ -328,6 +362,31 @@ async def supervise() -> int:
         return 1
 
     ipv = get_ipv()
+    if using_fallback_token:
+        try:
+            exit_code, reached_runtime_limit = await run_service_cycle(
+                ipv,
+                cloudflare_token,
+                uptime_port,
+                architecture_suffix,
+                using_fallback_token=True,
+            )
+        except RuntimeBinaryDownloadError as exc:
+            print(f"[-] {exc}", file=sys.stderr, flush=True)
+            return 1
+        except FileNotFoundError as exc:
+            print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
+            return 1
+        except OSError as exc:
+            print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
+            return 1
+
+        if reached_runtime_limit:
+            return 0
+
+        print("[-] 回退 Token 模式在达到运行上限前结束。", file=sys.stderr, flush=True)
+        return exit_code if exit_code != 0 else 1
+
     while True:
         try:
             await run_service_cycle(
