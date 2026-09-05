@@ -11,6 +11,8 @@ const DOWNLOAD_RETRY_DELAY_MS = 120 * 1000;
 const DOWNLOAD_TIMEOUT_MS = 60 * 1000;
 const BINARY_DELETE_DELAY_MS = 3 * 1000;
 const PROCESS_TERMINATE_TIMEOUT_MS = 10 * 1000;
+const FALLBACK_CLOUDFLARE_TOKEN_ENVIRONMENT_NAME = 'CLOUDFLARE_FALLBACK_TOKEN';
+const FALLBACK_TOKEN_RUNTIME_MS = 10 * 60 * 1000;
 const APP_DIRECTORY = __dirname;
 const X_TUNNEL = path.join(APP_DIRECTORY, 'x');
 const CLOUDFLARED = path.join(APP_DIRECTORY, 'c');
@@ -224,7 +226,7 @@ async function runServiceCycle(configuration) {
         console.warn('[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。');
         removeFileIfPresent(X_TUNNEL);
         removeFileIfPresent(CLOUDFLARED);
-        return;
+        return false;
     }
 
     const cloudflaredArguments = [
@@ -239,16 +241,46 @@ async function runServiceCycle(configuration) {
         removeFileIfPresent(CLOUDFLARED);
     }, BINARY_DELETE_DELAY_MS);
 
-    const tunnelExit = await waitForTunnelExit([
+    const tunnelExitPromise = waitForTunnelExit([
         ['x-tunnel', xTunnel],
         ['cloudflared', cloudflared],
     ]);
-    console.warn(`[-] ${tunnelExit.name} 已退出（${tunnelExit.detail}），本轮服务结束。`);
+
+    let fallbackTimer;
+    let result;
+    if (configuration.usingFallbackToken) {
+        const fallbackTimeoutPromise = new Promise((resolve) => {
+            fallbackTimer = setTimeout(
+                () => resolve({ reachedRuntimeLimit: true }),
+                FALLBACK_TOKEN_RUNTIME_MS,
+            );
+        });
+        result = await Promise.race([
+            tunnelExitPromise.then((tunnelExit) => ({ reachedRuntimeLimit: false, tunnelExit })),
+            fallbackTimeoutPromise,
+        ]);
+    } else {
+        result = {
+            reachedRuntimeLimit: false,
+            tunnelExit: await tunnelExitPromise,
+        };
+    }
+
+    clearTimeout(fallbackTimer);
+    if (result.reachedRuntimeLimit) {
+        console.log('[fallback] 已达到 600 秒运行上限，正在停止 cloudflared 和 x-tunnel。');
+    } else {
+        console.warn(`[-] ${result.tunnelExit.name} 已退出（${result.tunnelExit.detail}），本轮服务结束。`);
+    }
 
     clearTimeout(deleteTimer);
-    removeFileIfPresent(X_TUNNEL);
-    removeFileIfPresent(CLOUDFLARED);
-    await Promise.all([stopChild(xTunnel), stopChild(cloudflared)]);
+    try {
+        removeFileIfPresent(X_TUNNEL);
+        removeFileIfPresent(CLOUDFLARED);
+    } finally {
+        await Promise.all([stopChild(xTunnel), stopChild(cloudflared)]);
+    }
+    return result.reachedRuntimeLimit;
 }
 
 function renderStatusPage(startTime, startDate) {
@@ -302,23 +334,50 @@ function startWebServer(port) {
     });
 }
 
+function closeWebServer(server) {
+    return new Promise((resolve, reject) => {
+        server.close((error) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            resolve();
+        });
+    });
+}
+
 async function supervise(configuration) {
     while (true) {
-        await runServiceCycle(configuration);
+        const reachedRuntimeLimit = await runServiceCycle(configuration);
+        if (configuration.usingFallbackToken) {
+            if (reachedRuntimeLimit) {
+                return;
+            }
+            throw new Error('回退 Token 模式在达到运行上限前结束');
+        }
         console.log(`[restart] ${RESTART_DELAY_MS / 1000} 秒后整体重启服务...`);
         await delay(RESTART_DELAY_MS);
     }
 }
 
 async function init() {
-    const cloudflareToken = getFirstNonEmptyEnvironmentValue([
+    const configuredCloudflareToken = getFirstNonEmptyEnvironmentValue([
         'envToken',
         'ENV_TOKEN',
         'token',
         'TOKEN',
     ]);
+    const fallbackCloudflareToken = configuredCloudflareToken
+        ? ''
+        : process.env[FALLBACK_CLOUDFLARE_TOKEN_ENVIRONMENT_NAME] || '';
+    const usingFallbackToken = !configuredCloudflareToken && Boolean(fallbackCloudflareToken);
+    const cloudflareToken = configuredCloudflareToken || fallbackCloudflareToken;
     if (!cloudflareToken) {
         throw new Error('未检测到 Cloudflare Tunnel token');
+    }
+
+    if (usingFallbackToken) {
+        console.log('[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。');
     }
 
     const configuration = {
@@ -326,11 +385,18 @@ async function init() {
         cloudflareToken,
         xTunnelToken: process.env.TOKEN || '',
         ipv: process.env.IPV === '6' ? '6' : '4',
+        usingFallbackToken,
     };
     const statusPort = process.env.SERVER_PORT || process.env.PORT || STATUS_DEFAULT_PORT;
 
-    await startWebServer(statusPort);
-    await supervise(configuration);
+    const statusServer = await startWebServer(statusPort);
+    try {
+        await supervise(configuration);
+    } finally {
+        if (usingFallbackToken) {
+            await closeWebServer(statusServer);
+        }
+    }
 }
 
 init().catch((error) => {
