@@ -30,7 +30,7 @@ TUNNEL_STARTUP_CHECK_DELAY_SECONDS = 1
 APP_DIRECTORY = Path(os.environ.get("APP_DIR", Path(__file__).resolve().parent))
 X_TUNNEL = APP_DIRECTORY / "xxx"
 CLOUDFLARED = APP_DIRECTORY / "ccc"
-DOWNLOAD_TIMEOUT_SECONDS = 60
+DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 EXECUTABLE_FILE_MODE = 0o755
 X_TUNNEL_DOWNLOAD_BASE_URL = "https://www.baipiao.eu.org/xtunnel/x-tunnel-linux-"
@@ -548,16 +548,32 @@ def download_binary(url: str, destination: Path) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def download_runtime_binaries(architecture_suffix: str) -> None:
-    """Reproduce the Dockerfile's architecture-specific runtime binary downloads."""
-    print(f"[download] 检测到 Linux 架构: {platform.machine()}", flush=True)
-    try:
-        download_binary(f"{X_TUNNEL_DOWNLOAD_BASE_URL}{architecture_suffix}", X_TUNNEL)
-        download_binary(f"{CLOUDFLARED_DOWNLOAD_BASE_URL}{architecture_suffix}", CLOUDFLARED)
-    except RuntimeBinaryDownloadError:
-        X_TUNNEL.unlink(missing_ok=True)
-        CLOUDFLARED.unlink(missing_ok=True)
-        raise
+async def download_runtime_binaries(architecture_suffix: str) -> None:
+    """Download both runtime binaries, retrying failures without closing the status page."""
+
+    while True:
+        try:
+            print(f"[download] 检测到 Linux 架构: {platform.machine()}", flush=True)
+            await asyncio.to_thread(
+                download_binary,
+                f"{X_TUNNEL_DOWNLOAD_BASE_URL}{architecture_suffix}",
+                X_TUNNEL,
+            )
+            await asyncio.to_thread(
+                download_binary,
+                f"{CLOUDFLARED_DOWNLOAD_BASE_URL}{architecture_suffix}",
+                CLOUDFLARED,
+            )
+            return
+        except RuntimeBinaryDownloadError as exc:
+            X_TUNNEL.unlink(missing_ok=True)
+            CLOUDFLARED.unlink(missing_ok=True)
+            print(f"[-] 下载运行时二进制失败: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"[-] {DOWNLOAD_RETRY_DELAY_SECONDS} 秒后重试...",
+                flush=True,
+            )
+            await asyncio.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
 
 
 def render_login_panel() -> str:
@@ -1054,7 +1070,7 @@ async def run_service_cycle(
                 name="web-token-configuration",
             )
 
-        await asyncio.to_thread(download_runtime_binaries, architecture_suffix)
+        await download_runtime_binaries(architecture_suffix)
 
         if (
             configuration_waiter is not None
@@ -1335,15 +1351,6 @@ async def supervise() -> int:
                     x_tunnel_token=x_tunnel_token,
                     configuration_updates=configuration_updates,
                 )
-            except RuntimeBinaryDownloadError as exc:
-                web_configuration = (
-                    web_token_configuration.claim_configuration_or_close()
-                )
-                if web_configuration is None:
-                    print(f"[-] {exc}", file=sys.stderr, flush=True)
-                    return 1
-                exit_code = 1
-                reached_runtime_limit = False
             except FileNotFoundError as exc:
                 web_configuration = (
                     web_token_configuration.claim_configuration_or_close()
@@ -1426,14 +1433,6 @@ async def supervise() -> int:
                     http_server_task,
                     x_tunnel_token=x_tunnel_token,
                 )
-            except RuntimeBinaryDownloadError as exc:
-                print(f"[-] {exc}", file=sys.stderr, flush=True)
-                print(
-                    f"[retry] {DOWNLOAD_RETRY_DELAY_SECONDS} 秒后重试下载...",
-                    flush=True,
-                )
-                await asyncio.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
-                continue
             except FileNotFoundError as exc:
                 print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
             except OSError as exc:
