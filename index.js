@@ -214,6 +214,10 @@ function stopChild(child) {
     });
 }
 
+async function stopCloudflaredForFallbackTimeout({ cloudflared }) {
+    await stopChild(cloudflared);
+}
+
 async function runServiceCycle(configuration) {
     await downloadRuntimeBinaries(configuration.architecture);
 
@@ -270,11 +274,12 @@ async function runServiceCycle(configuration) {
 
     clearTimeout(fallbackTimer);
     if (result.reachedRuntimeLimit) {
-        console.log('[fallback] 已达到 600 秒运行上限，正在停止 cloudflared 和 x-tunnel。');
-    } else {
-        console.warn(`[-] ${result.tunnelExit.name} 已退出（${result.tunnelExit.detail}），本轮服务结束。`);
+        console.log('[fallback] 已达到 600 秒运行上限，正在停止 cloudflared；保留本地 Web 服务和状态页。');
+        await stopCloudflaredForFallbackTimeout({ cloudflared });
+        return true;
     }
 
+    console.warn(`[-] ${result.tunnelExit.name} 已退出（${result.tunnelExit.detail}），本轮服务结束。`);
     clearTimeout(deleteTimer);
     try {
         removeFileIfPresent(X_TUNNEL);
@@ -348,12 +353,12 @@ function closeWebServer(server) {
     });
 }
 
-async function supervise(configuration) {
+async function supervise(configuration, runServiceCycleFunction = runServiceCycle) {
     while (true) {
-        const reachedRuntimeLimit = await runServiceCycle(configuration);
+        const reachedRuntimeLimit = await runServiceCycleFunction(configuration);
         if (configuration.usingFallbackToken) {
             if (reachedRuntimeLimit) {
-                return;
+                return true;
             }
             throw new Error('回退 Token 模式在达到运行上限前结束');
         }
@@ -362,8 +367,15 @@ async function supervise(configuration) {
     }
 }
 
-async function init() {
-    const configuredCloudflareToken = getFirstNonEmptyEnvironmentValue([
+async function init(dependencies = {}) {
+    const {
+        getFirstNonEmptyEnvironmentValueFunction = getFirstNonEmptyEnvironmentValue,
+        resolveArchitectureFunction = resolveArchitecture,
+        startWebServerFunction = startWebServer,
+        superviseFunction = supervise,
+        closeWebServerFunction = closeWebServer,
+    } = dependencies;
+    const configuredCloudflareToken = getFirstNonEmptyEnvironmentValueFunction([
         'envToken',
         'ENV_TOKEN',
         'token',
@@ -383,7 +395,7 @@ async function init() {
     }
 
     const configuration = {
-        architecture: resolveArchitecture(),
+        architecture: resolveArchitectureFunction(),
         cloudflareToken,
         xTunnelToken: process.env.TOKEN || '',
         ipv: process.env.IPV === '6' ? '6' : '4',
@@ -391,17 +403,27 @@ async function init() {
     };
     const statusPort = process.env.SERVER_PORT || process.env.PORT || STATUS_DEFAULT_PORT;
 
-    const statusServer = await startWebServer(statusPort);
+    const statusServer = await startWebServerFunction(statusPort);
+    let keepStatusServerRunning = false;
     try {
-        await supervise(configuration);
+        keepStatusServerRunning = await superviseFunction(configuration);
     } finally {
-        if (usingFallbackToken) {
-            await closeWebServer(statusServer);
+        if (usingFallbackToken && !keepStatusServerRunning) {
+            await closeWebServerFunction(statusServer);
         }
     }
 }
 
-init().catch((error) => {
-    console.error(`[-] 初始化严重故障: ${error.message}`);
-    process.exitCode = 1;
-});
+module.exports = {
+    init,
+    renderStatusPage,
+    stopCloudflaredForFallbackTimeout,
+    supervise,
+};
+
+if (require.main === module) {
+    init().catch((error) => {
+        console.error(`[-] 初始化严重故障: ${error.message}`);
+        process.exitCode = 1;
+    });
+}
