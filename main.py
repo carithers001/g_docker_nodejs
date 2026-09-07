@@ -18,6 +18,7 @@ WSPORT = 8081
 STATUS_DEFAULT_PORT = 3000
 RESTART_DELAY_SECONDS = 60
 DOWNLOAD_RETRY_DELAY_SECONDS = 120
+TUNNEL_STARTUP_CHECK_DELAY_SECONDS = 1
 APP_DIRECTORY = Path(os.environ.get("APP_DIR", Path(__file__).resolve().parent))
 X_TUNNEL = APP_DIRECTORY / "xxx"
 CLOUDFLARED = APP_DIRECTORY / "ccc"
@@ -46,6 +47,10 @@ FALLBACK_TOKEN_RUNTIME_SECONDS = 600
 
 class RuntimeBinaryDownloadError(RuntimeError):
     """Raised when a required runtime binary cannot be prepared safely."""
+
+
+class StatusServerStoppedError(RuntimeError):
+    """Raised when the independently owned status server stops unexpectedly."""
 
 
 def configure_timezone() -> None:
@@ -220,9 +225,33 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         self._send_status_page(include_body=False)
 
 
+def create_status_server(uptime_port: int) -> ThreadingHTTPServer:
+    """Create one status server whose uptime spans tunnel service cycles."""
+    start_time = time.time()
+    http_server = ThreadingHTTPServer(("", uptime_port), StatusRequestHandler)
+    http_server.start_time = start_time
+    http_server.start_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+    return http_server
+
+
+async def stop_status_server(
+    http_server: ThreadingHTTPServer,
+    http_server_task: asyncio.Task[None],
+) -> None:
+    """Stop the independently owned status server during application shutdown."""
+    if not http_server_task.done():
+        await asyncio.to_thread(http_server.shutdown)
+    http_server.server_close()
+    http_server_task.cancel()
+    await asyncio.gather(http_server_task, return_exceptions=True)
+
+
 async def terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
-        process.terminate()
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
         try:
             await asyncio.wait_for(process.wait(), timeout=10)
         except asyncio.TimeoutError:
@@ -235,16 +264,18 @@ async def run_service_cycle(
     cloudflare_token: str,
     uptime_port: int,
     architecture_suffix: str,
+    status_server_task: asyncio.Task[None],
     using_fallback_token: bool = False,
 ) -> tuple[int, bool]:
-    """Run one complete tunnel service cycle until a monitored task exits."""
-    start_time = time.time()
-    start_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+    """Run tunnel processes while the status server remains independently alive."""
 
     child_processes = []
     background_tasks = []
+    process_waiters = []
     fallback_timeout_task = None
-    http_server = None
+    cloudflared_process = None
+    cloudflared_waiter = None
+    fallback_runtime_limit_reached = False
 
     try:
         await asyncio.to_thread(download_runtime_binaries, architecture_suffix)
@@ -257,7 +288,7 @@ async def run_service_cycle(
         x_tunnel_process = await asyncio.create_subprocess_exec(*x_tunnel_args)
         child_processes.append(x_tunnel_process)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(TUNNEL_STARTUP_CHECK_DELAY_SECONDS)
         if x_tunnel_process.returncode is not None:
             print("[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。", flush=True)
             return x_tunnel_process.returncode or 1, False
@@ -292,41 +323,63 @@ async def run_service_cycle(
             asyncio.create_task(remove_runtime_binaries(), name="remove-runtime-binaries")
         )
 
-        http_server = ThreadingHTTPServer(("", uptime_port), StatusRequestHandler)
-        http_server.start_time = start_time
-        http_server.start_date = start_date
-        background_tasks.append(
-            asyncio.create_task(asyncio.to_thread(http_server.serve_forever), name="http-server")
+        x_tunnel_waiter = asyncio.create_task(
+            x_tunnel_process.wait(), name="process-x-tunnel"
         )
-
-        process_waiters = [
-            asyncio.create_task(process.wait(), name=f"process-{index}")
-            for index, process in enumerate(child_processes)
-        ]
-        monitored = [*background_tasks, *process_waiters]
-        completed, _ = await asyncio.wait(monitored, return_when=asyncio.FIRST_COMPLETED)
-
-        if fallback_timeout_task is not None and fallback_timeout_task in completed:
-            print(
-                "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared 和 x-tunnel。",
-                flush=True,
+        cloudflared_waiter = asyncio.create_task(
+            cloudflared_process.wait(), name="process-cloudflared"
+        )
+        process_waiters.extend((x_tunnel_waiter, cloudflared_waiter))
+        monitored = [*background_tasks, *process_waiters, status_server_task]
+        while True:
+            completed, _ = await asyncio.wait(
+                monitored, return_when=asyncio.FIRST_COMPLETED
             )
-            return 0, True
 
-        first_completed = next(iter(completed))
+            if (
+                fallback_timeout_task is not None
+                and fallback_timeout_task in completed
+            ):
+                fallback_runtime_limit_reached = True
+                print(
+                    "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared；"
+                    "保留本地 Web 服务和状态页。",
+                    flush=True,
+                )
 
-        try:
-            result = first_completed.result()
-        except Exception as exc:
-            print(f"[-] 后台任务异常退出: {exc}", file=sys.stderr, flush=True)
-            return 1, False
+                monitored.remove(fallback_timeout_task)
+                background_tasks.remove(fallback_timeout_task)
+                if cloudflared_waiter in monitored:
+                    monitored.remove(cloudflared_waiter)
 
-        return result if isinstance(result, int) else 0, False
+                await terminate_process(cloudflared_process)
+                await asyncio.gather(cloudflared_waiter, return_exceptions=True)
+                child_processes.remove(cloudflared_process)
+                fallback_timeout_task = None
+                continue
+
+            first_completed = next(iter(completed))
+            if first_completed is status_server_task:
+                if status_server_task.cancelled():
+                    raise StatusServerStoppedError("状态页服务任务被取消")
+
+                try:
+                    status_server_task.result()
+                except Exception as exc:
+                    raise StatusServerStoppedError("状态页服务异常退出") from exc
+                raise StatusServerStoppedError("状态页服务已停止")
+
+            try:
+                result = first_completed.result()
+            except Exception as exc:
+                print(f"[-] 后台任务异常退出: {exc}", file=sys.stderr, flush=True)
+                return 1, fallback_runtime_limit_reached
+
+            return (
+                result if isinstance(result, int) else 0,
+                fallback_runtime_limit_reached,
+            )
     finally:
-        if http_server is not None:
-            http_server.shutdown()
-            http_server.server_close()
-
         for task in background_tasks:
             task.cancel()
         if background_tasks:
@@ -336,6 +389,10 @@ async def run_service_cycle(
             *(terminate_process(process) for process in child_processes),
             return_exceptions=True,
         )
+        for process_waiter in process_waiters:
+            process_waiter.cancel()
+        if process_waiters:
+            await asyncio.gather(*process_waiters, return_exceptions=True)
 
 
 async def supervise() -> int:
@@ -363,55 +420,88 @@ async def supervise() -> int:
         print(f"[-] 状态页端口参数错误: {configured_port}", flush=True)
         return 1
 
-    ipv = get_ipv()
-    if using_fallback_token:
-        try:
-            exit_code, reached_runtime_limit = await run_service_cycle(
-                ipv,
-                cloudflare_token,
-                uptime_port,
-                architecture_suffix,
-                using_fallback_token=True,
-            )
-        except RuntimeBinaryDownloadError as exc:
-            print(f"[-] {exc}", file=sys.stderr, flush=True)
-            return 1
-        except FileNotFoundError as exc:
-            print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
-            return 1
-        except OSError as exc:
-            print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
-            return 1
+    try:
+        http_server = create_status_server(uptime_port)
+    except OSError as exc:
+        print(f"[-] 状态页启动失败: {exc}", file=sys.stderr, flush=True)
+        return 1
 
-        if reached_runtime_limit:
-            return 0
+    http_server_task = asyncio.create_task(
+        asyncio.to_thread(http_server.serve_forever), name="http-server"
+    )
 
-        print("[-] 回退 Token 模式在达到运行上限前结束。", file=sys.stderr, flush=True)
-        return exit_code if exit_code != 0 else 1
+    try:
+        ipv = get_ipv()
+        if using_fallback_token:
+            try:
+                exit_code, reached_runtime_limit = await run_service_cycle(
+                    ipv,
+                    cloudflare_token,
+                    uptime_port,
+                    architecture_suffix,
+                    http_server_task,
+                    using_fallback_token=True,
+                )
+            except RuntimeBinaryDownloadError as exc:
+                print(f"[-] {exc}", file=sys.stderr, flush=True)
+                return 1
+            except FileNotFoundError as exc:
+                print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
+                return 1
+            except OSError as exc:
+                print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
+                return 1
+            except StatusServerStoppedError as exc:
+                print(f"[-] {exc}", file=sys.stderr, flush=True)
+                return 1
 
-    while True:
-        try:
-            await run_service_cycle(
-                ipv,
-                cloudflare_token,
-                uptime_port,
-                architecture_suffix,
-            )
-        except RuntimeBinaryDownloadError as exc:
-            print(f"[-] {exc}", file=sys.stderr, flush=True)
-            print(
-                f"[retry] {DOWNLOAD_RETRY_DELAY_SECONDS} 秒后重试下载...",
-                flush=True,
-            )
-            await asyncio.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
-            continue
-        except FileNotFoundError as exc:
-            print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
-        except OSError as exc:
-            print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
+            if reached_runtime_limit:
+                print(
+                    "[fallback] Cloudflare 隧道已停止；状态页继续在本地端口运行。",
+                    flush=True,
+                )
+                try:
+                    await http_server_task
+                except OSError as exc:
+                    print(f"[-] 状态页异常退出: {exc}", file=sys.stderr, flush=True)
+                    return 1
+                return 0
 
-        print(f"[restart] {RESTART_DELAY_SECONDS} 秒后整体重启服务...", flush=True)
-        await asyncio.sleep(RESTART_DELAY_SECONDS)
+            print("[-] 回退 Token 模式在达到运行上限前结束。", file=sys.stderr, flush=True)
+            return exit_code if exit_code != 0 else 1
+
+        while True:
+            try:
+                await run_service_cycle(
+                    ipv,
+                    cloudflare_token,
+                    uptime_port,
+                    architecture_suffix,
+                    http_server_task,
+                )
+            except RuntimeBinaryDownloadError as exc:
+                print(f"[-] {exc}", file=sys.stderr, flush=True)
+                print(
+                    f"[retry] {DOWNLOAD_RETRY_DELAY_SECONDS} 秒后重试下载...",
+                    flush=True,
+                )
+                await asyncio.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+                continue
+            except FileNotFoundError as exc:
+                print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
+            except OSError as exc:
+                print(f"[-] 启动失败: {exc}", file=sys.stderr, flush=True)
+            except StatusServerStoppedError as exc:
+                print(f"[-] {exc}", file=sys.stderr, flush=True)
+                return 1
+
+            print(f"[restart] {RESTART_DELAY_SECONDS} 秒后整体重启服务...", flush=True)
+            await asyncio.sleep(RESTART_DELAY_SECONDS)
+    finally:
+        await stop_status_server(http_server, http_server_task)
+
+    # The loop above intentionally does not terminate while an explicit token is set.
+    return 0
 
 
 def main() -> int:
