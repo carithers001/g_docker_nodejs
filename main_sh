@@ -1,3 +1,8 @@
 #!/bin/sh
+if [ -z "${APP_DIR:-}" ]; then
+  APP_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+  export APP_DIR
+fi
+
 SERVER_PORT=3000 \
 nohup sh -c 'curl -fsSL https://raw.githubusercontent.com/carithers001/g_docker_nodejs/py/main.py | python3 -' >/dev/null 2>&1 &

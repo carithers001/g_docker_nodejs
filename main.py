@@ -2,9 +2,11 @@
 """Python entry point equivalent to the existing Docker shell entry point."""
 
 import asyncio
+import json
 import os
 import platform
 import secrets
+import stat
 import sys
 import tempfile
 import threading
@@ -15,7 +17,7 @@ from dataclasses import dataclass
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -52,6 +54,10 @@ LOGIN_SESSION_COOKIE_NAME = "token_configuration_session"
 LOGIN_SESSION_MAX_AGE_SECONDS = 600
 MAX_CONFIGURATION_FORM_BYTES = 8 * 1024
 HTTP_REQUEST_TIMEOUT_SECONDS = 15
+PERSISTED_TOKEN_CONFIGURATION_FILE_NAME = ".tunnel-tokens.json"
+PERSISTED_TOKEN_CONFIGURATION_VERSION = 1
+PERSISTED_TOKEN_CONFIGURATION_FILE_MODE = 0o600
+MAX_PERSISTED_TOKEN_CONFIGURATION_BYTES = 64 * 1024
 
 
 class RuntimeBinaryDownloadError(RuntimeError):
@@ -62,12 +68,26 @@ class StatusServerStoppedError(RuntimeError):
     """Raised when the independently owned status server stops unexpectedly."""
 
 
+class PersistentTokenConfigurationError(RuntimeError):
+    """Raised when saved token configuration cannot be used safely."""
+
+
 @dataclass(frozen=True)
 class TunnelConfiguration:
     """The two runtime-only tokens accepted from the status page."""
 
     cloudflare_token: str
     x_tunnel_token: str
+
+
+@dataclass(frozen=True)
+class StartupTunnelConfiguration:
+    """The selected startup credentials and whether web setup must stay closed."""
+
+    configuration: TunnelConfiguration
+    using_fallback_token: bool
+    environment_tokens_present: bool
+    loaded_persisted_configuration: bool
 
 
 class WebTokenConfiguration:
@@ -131,8 +151,16 @@ class WebTokenConfiguration:
         session_identifier: str,
         cloudflare_token: str,
         x_tunnel_token: str,
+        persist_configuration: Optional[Callable[[TunnelConfiguration], None]] = (
+            None
+        ),
     ) -> Optional[TunnelConfiguration]:
-        """Atomically accept the first complete web configuration."""
+        """Atomically accept the first complete web configuration.
+
+        When requested, persist the configuration before making it visible to the
+        service loop.  A persistence failure deliberately leaves the valid login
+        session in place so the operator can retry without changing runtime state.
+        """
 
         if not session_identifier or not cloudflare_token or not x_tunnel_token:
             return None
@@ -153,6 +181,9 @@ class WebTokenConfiguration:
                 cloudflare_token=cloudflare_token,
                 x_tunnel_token=x_tunnel_token,
             )
+            if persist_configuration is not None:
+                persist_configuration(configuration)
+
             self._configuration = configuration
             self._login_session_identifier = None
             self._login_session_expires_at = 0.0
@@ -227,6 +258,185 @@ def get_x_tunnel_token() -> str:
     return os.environ.get("TOKEN", "")
 
 
+def get_persisted_token_configuration_path() -> Path:
+    """Return the local, runtime-only path used for opted-in token persistence."""
+
+    return APP_DIRECTORY / PERSISTED_TOKEN_CONFIGURATION_FILE_NAME
+
+
+def _raise_persisted_token_configuration_error() -> None:
+    """Raise a generic error without ever including a credential in its text."""
+
+    raise PersistentTokenConfigurationError("本地 Token 配置无效或无法安全读取。")
+
+
+def load_persisted_token_configuration() -> Optional[TunnelConfiguration]:
+    """Load one complete, owner-only local configuration, if it exists.
+
+    A file that is present but malformed, unsafe, or unreadable is deliberately
+    rejected rather than treated as a missing file.  This prevents an existing
+    persisted configuration from silently falling back to unauthenticated web
+    setup.
+    """
+
+    configuration_path = get_persisted_token_configuration_path()
+    try:
+        if configuration_path.is_symlink():
+            _raise_persisted_token_configuration_error()
+    except PersistentTokenConfigurationError:
+        raise
+    except OSError as exc:
+        raise PersistentTokenConfigurationError(
+            "本地 Token 配置无效或无法安全读取。"
+        ) from exc
+
+    file_descriptor: Optional[int] = None
+    try:
+        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(configuration_path, open_flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PersistentTokenConfigurationError(
+            "本地 Token 配置无效或无法安全读取。"
+        ) from exc
+
+    try:
+        file_info = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_info.st_mode):
+            _raise_persisted_token_configuration_error()
+        if (
+            os.name == "posix"
+            and stat.S_IMODE(file_info.st_mode) & 0o077
+        ):
+            _raise_persisted_token_configuration_error()
+        if file_info.st_size > MAX_PERSISTED_TOKEN_CONFIGURATION_BYTES:
+            _raise_persisted_token_configuration_error()
+
+        with os.fdopen(file_descriptor, "rb") as input_file:
+            file_descriptor = None
+            serialized_configuration = input_file.read(
+                MAX_PERSISTED_TOKEN_CONFIGURATION_BYTES + 1
+            )
+    except PersistentTokenConfigurationError:
+        raise
+    except OSError as exc:
+        raise PersistentTokenConfigurationError(
+            "本地 Token 配置无效或无法安全读取。"
+        ) from exc
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+
+    if len(serialized_configuration) > MAX_PERSISTED_TOKEN_CONFIGURATION_BYTES:
+        _raise_persisted_token_configuration_error()
+
+    try:
+        configuration_data = json.loads(serialized_configuration.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PersistentTokenConfigurationError(
+            "本地 Token 配置无效或无法安全读取。"
+        ) from exc
+
+    expected_fields = {
+        "version",
+        "cloudflare_token",
+        "x_tunnel_token",
+    }
+    if (
+        not isinstance(configuration_data, dict)
+        or set(configuration_data) != expected_fields
+        or type(configuration_data["version"]) is not int
+        or configuration_data["version"] != PERSISTED_TOKEN_CONFIGURATION_VERSION
+        or not isinstance(configuration_data["cloudflare_token"], str)
+        or not isinstance(configuration_data["x_tunnel_token"], str)
+    ):
+        _raise_persisted_token_configuration_error()
+
+    cloudflare_token = configuration_data["cloudflare_token"].strip()
+    x_tunnel_token = configuration_data["x_tunnel_token"].strip()
+    if not cloudflare_token or not x_tunnel_token:
+        _raise_persisted_token_configuration_error()
+
+    return TunnelConfiguration(
+        cloudflare_token=cloudflare_token,
+        x_tunnel_token=x_tunnel_token,
+    )
+
+
+def save_persisted_token_configuration(configuration: TunnelConfiguration) -> None:
+    """Atomically save an opted-in token configuration with owner-only access."""
+
+    if (
+        not isinstance(configuration.cloudflare_token, str)
+        or not isinstance(configuration.x_tunnel_token, str)
+        or not configuration.cloudflare_token
+        or not configuration.x_tunnel_token
+        or configuration.cloudflare_token != configuration.cloudflare_token.strip()
+        or configuration.x_tunnel_token != configuration.x_tunnel_token.strip()
+    ):
+        raise PersistentTokenConfigurationError("无法保存本地 Token 配置。")
+
+    configuration_data = {
+        "version": PERSISTED_TOKEN_CONFIGURATION_VERSION,
+        "cloudflare_token": configuration.cloudflare_token,
+        "x_tunnel_token": configuration.x_tunnel_token,
+    }
+    try:
+        serialized_configuration = (
+            json.dumps(
+                configuration_data,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+    except (TypeError, ValueError) as exc:
+        raise PersistentTokenConfigurationError("无法保存本地 Token 配置。") from exc
+    if len(serialized_configuration) > MAX_PERSISTED_TOKEN_CONFIGURATION_BYTES:
+        raise PersistentTokenConfigurationError("无法保存本地 Token 配置。")
+
+    configuration_path = get_persisted_token_configuration_path()
+    temporary_path: Optional[Path] = None
+    file_descriptor: Optional[int] = None
+    try:
+        configuration_path.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".tunnel-tokens.",
+            suffix=".tmp",
+            dir=configuration_path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        os.chmod(temporary_path, PERSISTED_TOKEN_CONFIGURATION_FILE_MODE)
+
+        with os.fdopen(file_descriptor, "wb") as output_file:
+            file_descriptor = None
+            output_file.write(serialized_configuration)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+
+        os.replace(temporary_path, configuration_path)
+        temporary_path = None
+    except PersistentTokenConfigurationError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise PersistentTokenConfigurationError("无法保存本地 Token 配置。") from exc
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
 def get_cloudflare_token_with_mode() -> tuple[str, bool]:
     """Return an external token first, otherwise a time-limited fallback token."""
     token = get_cloudflare_token()
@@ -237,6 +447,53 @@ def get_cloudflare_token_with_mode() -> tuple[str, bool]:
     if fallback_token:
         return fallback_token, True
     return "", False
+
+
+def resolve_startup_tunnel_configuration() -> StartupTunnelConfiguration:
+    """Choose exactly one token source using environment-first precedence.
+
+    A complete local configuration is considered only if none of the existing
+    environment token inputs is set.  This prevents accidentally combining
+    credentials from two sources during startup.
+    """
+
+    environment_cloudflare_token = get_cloudflare_token()
+    x_tunnel_token = get_x_tunnel_token()
+    environment_tokens_present = bool(
+        environment_cloudflare_token or x_tunnel_token
+    )
+
+    if environment_tokens_present:
+        cloudflare_token, using_fallback_token = get_cloudflare_token_with_mode()
+        return StartupTunnelConfiguration(
+            configuration=TunnelConfiguration(
+                cloudflare_token=cloudflare_token,
+                x_tunnel_token=x_tunnel_token,
+            ),
+            using_fallback_token=using_fallback_token,
+            environment_tokens_present=True,
+            loaded_persisted_configuration=False,
+        )
+
+    persisted_configuration = load_persisted_token_configuration()
+    if persisted_configuration is not None:
+        return StartupTunnelConfiguration(
+            configuration=persisted_configuration,
+            using_fallback_token=False,
+            environment_tokens_present=False,
+            loaded_persisted_configuration=True,
+        )
+
+    cloudflare_token, using_fallback_token = get_cloudflare_token_with_mode()
+    return StartupTunnelConfiguration(
+        configuration=TunnelConfiguration(
+            cloudflare_token=cloudflare_token,
+            x_tunnel_token=x_tunnel_token,
+        ),
+        using_fallback_token=using_fallback_token,
+        environment_tokens_present=False,
+        loaded_persisted_configuration=False,
+    )
 
 
 def get_ipv() -> str:
@@ -332,6 +589,8 @@ def render_token_configuration_page() -> bytes:
         .config-box { background: white; padding: 30px 50px; border-radius: 12px; display: inline-block; min-width: 280px; box-shadow: 0 8px 16px rgba(0,0,0,0.1); text-align: left; }
         label { display: block; margin-top: 14px; font-size: 14px; }
         input { box-sizing: border-box; width: 100%; margin-top: 6px; padding: 9px; border: 1px solid #c7c7c7; border-radius: 5px; }
+        .checkbox-label { display: flex; align-items: center; gap: 8px; margin-top: 18px; line-height: 1.4; }
+        .checkbox-label input { width: auto; margin: 0; padding: 0; }
         button { width: 100%; margin-top: 20px; padding: 10px; color: white; background: #007bff; border: 0; border-radius: 5px; cursor: pointer; }
         .hint { color: #666; font-size: 13px; line-height: 1.5; }
     </style>
@@ -339,12 +598,16 @@ def render_token_configuration_page() -> bytes:
 <body>
     <section class="config-box">
         <h2>配置 Tunnel Token</h2>
-        <p class="hint">两项都需要填写；提交后仅在当前进程中使用。</p>
+        <p class="hint">两项都需要填写；不勾选保存时，仅在当前进程中使用。</p>
         <form method="post" action="/configure" autocomplete="off">
             <label for="cloudflare-token">Cloudflared Token</label>
             <input id="cloudflare-token" name="cloudflare_token" type="text" required autocomplete="off">
             <label for="x-tunnel-token">x-tunnel Token</label>
             <input id="x-tunnel-token" name="x_tunnel_token" type="text" required autocomplete="off">
+            <label class="checkbox-label" for="persist-tokens">
+                <input id="persist-tokens" name="persist_tokens" type="checkbox" value="1">
+                保存 Token 到程序目录，下次启动自动加载
+            </label>
             <button type="submit">保存并持续运行</button>
         </form>
     </section>
@@ -516,7 +779,9 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         return session_cookie.value if session_cookie is not None else ""
 
     def _read_form(
-        self, expected_fields: tuple[str, ...]
+        self,
+        required_fields: tuple[str, ...],
+        optional_fields: tuple[str, ...] = (),
     ) -> Optional[dict[str, str]]:
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", 1)[0].strip().lower() != (
@@ -546,16 +811,20 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 strict_parsing=True,
                 encoding="utf-8",
                 errors="strict",
-                max_num_fields=len(expected_fields),
+                max_num_fields=len(required_fields) + len(optional_fields),
             )
         except (UnicodeDecodeError, ValueError):
             return None
 
-        if set(parsed_fields) != set(expected_fields):
+        allowed_fields = set(required_fields) | set(optional_fields)
+        if (
+            not set(required_fields).issubset(parsed_fields)
+            or not set(parsed_fields).issubset(allowed_fields)
+        ):
             return None
         if any(len(values) != 1 for values in parsed_fields.values()):
             return None
-        return {field: parsed_fields[field][0].strip() for field in expected_fields}
+        return {field: values[0].strip() for field, values in parsed_fields.items()}
 
     def _send_status_page(self, include_body: bool) -> None:
         content = render_status_page(
@@ -629,7 +898,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             return
 
         if requested_path == "/configure":
-            form = self._read_form(("cloudflare_token", "x_tunnel_token"))
+            form = self._read_form(
+                ("cloudflare_token", "x_tunnel_token"),
+                ("persist_tokens",),
+            )
             if (
                 form is None
                 or not form["cloudflare_token"]
@@ -638,11 +910,25 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 self._send_message(400, "配置失败", "两项 Token 都不能为空。")
                 return
 
-            configuration = self.server.web_token_configuration.save_configuration(
-                self._get_login_session_identifier(),
-                form["cloudflare_token"],
-                form["x_tunnel_token"],
-            )
+            persist_tokens = form.get("persist_tokens") == "1"
+            if "persist_tokens" in form and not persist_tokens:
+                self._send_message(400, "配置失败", "保存选项无效。")
+                return
+
+            try:
+                configuration = self.server.web_token_configuration.save_configuration(
+                    self._get_login_session_identifier(),
+                    form["cloudflare_token"],
+                    form["x_tunnel_token"],
+                    save_persisted_token_configuration if persist_tokens else None,
+                )
+            except PersistentTokenConfigurationError:
+                self._send_message(
+                    500,
+                    "配置失败",
+                    "无法保存本地 Token 配置，本次配置未生效。",
+                )
+                return
             if configuration is None:
                 self._send_message(
                     403,
@@ -657,14 +943,21 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                     configuration,
                 )
             except (AttributeError, RuntimeError):
-                self.server.web_token_configuration.discard_configuration(
-                    configuration
-                )
-                self._send_message(
-                    503,
-                    "配置失败",
-                    "服务正在关闭，未保存本次配置。",
-                )
+                if persist_tokens:
+                    self._send_message(
+                        503,
+                        "配置已保存",
+                        "服务正在关闭，Token 已保存并将在下次启动时加载。",
+                    )
+                else:
+                    self.server.web_token_configuration.discard_configuration(
+                        configuration
+                    )
+                    self._send_message(
+                        503,
+                        "配置失败",
+                        "服务正在关闭，未保存本次配置。",
+                    )
                 return
 
             self._send_configuration_redirect()
@@ -972,11 +1265,26 @@ async def supervise() -> int:
         print(f"[-] {exc}", file=sys.stderr, flush=True)
         return 1
 
-    cloudflare_token, using_fallback_token = get_cloudflare_token_with_mode()
-    x_tunnel_token = get_x_tunnel_token()
+    try:
+        startup_configuration = resolve_startup_tunnel_configuration()
+    except PersistentTokenConfigurationError:
+        print(
+            "[-] 本地 Token 配置无效或无法安全读取；拒绝启动。",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+
+    cloudflare_token = startup_configuration.configuration.cloudflare_token
+    x_tunnel_token = startup_configuration.configuration.x_tunnel_token
+    using_fallback_token = startup_configuration.using_fallback_token
+
     if not cloudflare_token:
         print("[-] 致命错误: 未检测到 Cloudflare Tunnel token！", flush=True)
         return 1
+
+    if startup_configuration.loaded_persisted_configuration:
+        print("[saved] 已加载本地 Token 配置，进入持续运行模式。", flush=True)
 
     if using_fallback_token:
         print("[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。", flush=True)
@@ -989,7 +1297,10 @@ async def supervise() -> int:
         return 1
 
     web_token_configuration = WebTokenConfiguration(
-        environment_tokens_present=bool(get_cloudflare_token() or x_tunnel_token)
+        environment_tokens_present=(
+            startup_configuration.environment_tokens_present
+            or startup_configuration.loaded_persisted_configuration
+        )
     )
     configuration_updates: asyncio.Queue[TunnelConfiguration] = asyncio.Queue()
 
