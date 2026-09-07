@@ -144,15 +144,13 @@ force_terminate_process() {
     fi
 }
 
-stop_tunnels_for_fallback_timeout() {
+stop_cloudflared_for_fallback_timeout() {
     local elapsed_seconds=0
 
-    terminate_process "$X_TUNNEL_PID"
     terminate_process "$CLOUDFLARED_PID"
 
-    while kill -0 "$X_TUNNEL_PID" 2>/dev/null || kill -0 "$CLOUDFLARED_PID" 2>/dev/null; do
+    while kill -0 "$CLOUDFLARED_PID" 2>/dev/null; do
         if [ "$elapsed_seconds" -ge "$FALLBACK_TERMINATION_GRACE_SECONDS" ]; then
-            force_terminate_process "$X_TUNNEL_PID"
             force_terminate_process "$CLOUDFLARED_PID"
             break
         fi
@@ -252,10 +250,19 @@ run_service_cycle() {
     local tunnel_exit_code=$?
 
     if [ "$USING_FALLBACK_CLOUDFLARE_TOKEN" -eq 1 ] && [ "$completed_pid" = "$FALLBACK_TIMER_PID" ]; then
-        echo "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared 和 x-tunnel。"
-        stop_tunnels_for_fallback_timeout
+        echo "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared；保留本地 Web 服务和状态页。"
+        FALLBACK_TIMER_PID=""
+        stop_cloudflared_for_fallback_timeout
+        wait "$CLOUDFLARED_PID" 2>/dev/null || true
+        CLOUDFLARED_PID=""
+
+        # Do not run cleanup here: it would stop x-tunnel, the status updater,
+        # and busybox httpd. Keep the local status page alive after fallback expiry.
+        wait "$HTTP_SERVER_PID"
+        local status_server_exit_code=$?
+        echo "[-] 状态页服务已退出。"
         cleanup_service_cycle
-        return 0
+        return "$status_server_exit_code"
     fi
 
     echo "[-] 隧道进程已退出，本轮服务结束。"
