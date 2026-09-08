@@ -53,6 +53,8 @@ DEFAULT_TOKEN = "JhIjoiZDZkMzEzZjA2MzI1OGJjODllNzc4YmVlMDQ5YTZmOTEiLCJ0IjoiYmYwY
 FALLBACK_TOKEN_RUNTIME_SECONDS = 600
 LOGIN_SESSION_COOKIE_NAME = "token_configuration_session"
 LOGIN_SESSION_MAX_AGE_SECONDS = 600
+LOGIN_USERNAME = "x"
+LOGIN_PASSWORD = "x"
 MAX_CONFIGURATION_FORM_BYTES = 8 * 1024
 HTTP_REQUEST_TIMEOUT_SECONDS = 15
 PERSISTED_TOKEN_CONFIGURATION_FILE_NAME = ".tunnel-tokens.json"
@@ -110,9 +112,14 @@ class WebTokenConfiguration:
             self._login_session_expires_at = 0.0
 
     def begin_login(self, username: str, password: str) -> Optional[str]:
-        """Create a short-lived login session only while fallback mode is open."""
+        """Create a short-lived session for the configured login while setup is open."""
 
-        if not username or not password:
+        if (
+            not username
+            or not password
+            or username != LOGIN_USERNAME
+            or password != LOGIN_PASSWORD
+        ):
             return None
 
         with self._lock:
