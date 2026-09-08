@@ -5,8 +5,13 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
 
+const STATUS_DEFAULT_PORT = 3001;
+const STATUS_EXTRA_DEFAULT_PORT = 3000;
 const WSPORT = 8081;
-const STATUS_DEFAULT_PORT = 3000;
+const STATUS_EXTRA_PORT_ENVIRONMENT_NAME = 'STATUS_EXTRA_PORT';
+const EPHEMERAL_NETWORK_PORT = 0;
+const MINIMUM_NETWORK_PORT = 1;
+const MAXIMUM_NETWORK_PORT = 65535;
 const RESTART_DELAY_MS = 60 * 1000;
 const DOWNLOAD_RETRY_DELAY_MS = 120 * 1000;
 const DOWNLOAD_TIMEOUT_MS = 120 * 1000;
@@ -25,6 +30,8 @@ const PERSISTED_TOKEN_CONFIGURATION_FILE_MODE = 0o600;
 const MAX_PERSISTED_TOKEN_CONFIGURATION_BYTES = 64 * 1024;
 const LOGIN_SESSION_COOKIE_NAME = 'tunnel_configuration_session';
 const LOGIN_SESSION_MAX_AGE_SECONDS = 5 * 60;
+const LOGIN_USERNAME = 'x';
+const LOGIN_PASSWORD = 'x';
 const MAX_FORM_BYTES = 8 * 1024;
 const HTTP_REQUEST_TIMEOUT_MS = 15 * 1000;
 
@@ -54,7 +61,7 @@ class WebTokenConfiguration {
     beginLogin(account, password) {
         if (!this.acceptingWebConfiguration || this.configuration || this.loginSession
             || typeof account !== 'string' || typeof password !== 'string'
-            || !account.trim() || !password.trim()) {
+            || account !== LOGIN_USERNAME || password !== LOGIN_PASSWORD) {
             return null;
         }
 
@@ -121,6 +128,42 @@ class WebTokenConfiguration {
         this.acceptingWebConfiguration = false;
         this.loginSession = null;
     }
+}
+
+function parseStatusPort(value, environmentName, allowEphemeralPort = false) {
+    const serializedPort = String(value).trim();
+    if (!/^[0-9]+$/.test(serializedPort)) {
+        throw new Error(`${environmentName} 必须是有效的端口号`);
+    }
+
+    const port = Number(serializedPort);
+    const minimumPort = allowEphemeralPort
+        ? EPHEMERAL_NETWORK_PORT
+        : MINIMUM_NETWORK_PORT;
+    if (!Number.isSafeInteger(port)
+        || port < minimumPort
+        || port > MAXIMUM_NETWORK_PORT) {
+        throw new Error(
+            `${environmentName} 必须在 ${minimumPort} 到 ${MAXIMUM_NETWORK_PORT} 之间`,
+        );
+    }
+    return port;
+}
+
+function getStatusPorts(environment = process.env) {
+    const primaryPort = parseStatusPort(
+        environment.SERVER_PORT || environment.PORT || STATUS_DEFAULT_PORT,
+        'SERVER_PORT 或 PORT',
+        true,
+    );
+    const extraPort = parseStatusPort(
+        environment[STATUS_EXTRA_PORT_ENVIRONMENT_NAME] || STATUS_EXTRA_DEFAULT_PORT,
+        STATUS_EXTRA_PORT_ENVIRONMENT_NAME,
+    );
+    if (primaryPort === extraPort) {
+        throw new Error('两个状态页监听端口不能相同');
+    }
+    return [primaryPort, extraPort];
 }
 
 function delay(milliseconds) {
@@ -951,9 +994,20 @@ function createStatusRequestHandler(startTime, startDate, webTokenConfiguration)
     };
 }
 
-function startWebServer(port, webTokenConfiguration = new WebTokenConfiguration({ environmentTokensPresent: true })) {
+function createStatusPageContext() {
     const startTime = Date.now();
-    const startDate = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    return {
+        startTime,
+        startDate: new Date(startTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+    };
+}
+
+function startWebServer(
+    port,
+    webTokenConfiguration = new WebTokenConfiguration({ environmentTokensPresent: true }),
+    statusPageContext = createStatusPageContext(),
+) {
+    const { startTime, startDate } = statusPageContext;
 
     return new Promise((resolve, reject) => {
         const server = http.createServer(createStatusRequestHandler(
@@ -975,6 +1029,10 @@ function startWebServer(port, webTokenConfiguration = new WebTokenConfiguration(
 
 function closeWebServer(server) {
     return new Promise((resolve, reject) => {
+        if (!server.listening) {
+            resolve();
+            return;
+        }
         server.close((error) => {
             if (error) {
                 reject(error);
@@ -983,6 +1041,49 @@ function closeWebServer(server) {
             resolve();
         });
     });
+}
+
+async function closeWebServers(servers, closeWebServerFunction = closeWebServer) {
+    const closeResults = await Promise.allSettled(
+        servers.map((server) => Promise.resolve().then(
+            () => closeWebServerFunction(server),
+        )),
+    );
+    const failedResult = closeResults.find((result) => result.status === 'rejected');
+    if (failedResult) {
+        throw failedResult.reason;
+    }
+}
+
+async function startWebServers(
+    ports,
+    webTokenConfiguration = new WebTokenConfiguration({ environmentTokensPresent: true }),
+    startWebServerFunction = startWebServer,
+    closeWebServerFunction = closeWebServer,
+) {
+    if (!Array.isArray(ports) || ports.length === 0) {
+        throw new Error('至少需要一个状态页监听端口');
+    }
+
+    const statusPageContext = createStatusPageContext();
+    const servers = [];
+    try {
+        for (const port of ports) {
+            servers.push(await startWebServerFunction(
+                port,
+                webTokenConfiguration,
+                statusPageContext,
+            ));
+        }
+    } catch (error) {
+        try {
+            await closeWebServers(servers, closeWebServerFunction);
+        } catch (cleanupError) {
+            error.cleanupError = cleanupError;
+        }
+        throw error;
+    }
+    return servers;
 }
 
 function withWebTokenConfiguration(configuration, webTokenConfiguration) {
@@ -1085,15 +1186,19 @@ async function init(dependencies = {}) {
         ipv: environment.IPV === '6' ? '6' : '4',
         usingFallbackToken: initialTokenConfiguration.usingFallbackToken,
     };
-    const statusPort = environment.SERVER_PORT || environment.PORT || STATUS_DEFAULT_PORT;
-
-    const statusServer = await startWebServerFunction(statusPort, webTokenConfiguration);
+    const statusPorts = getStatusPorts(environment);
+    const statusServers = await startWebServers(
+        statusPorts,
+        webTokenConfiguration,
+        startWebServerFunction,
+        closeWebServerFunction,
+    );
     let keepStatusServerRunning = false;
     try {
         keepStatusServerRunning = await superviseFunction(configuration, webTokenConfiguration);
     } finally {
         if (initialTokenConfiguration.usingFallbackToken && !keepStatusServerRunning) {
-            await closeWebServerFunction(statusServer);
+            await closeWebServers(statusServers, closeWebServerFunction);
         }
     }
 }
@@ -1101,7 +1206,10 @@ async function init(dependencies = {}) {
 module.exports = {
     WebTokenConfiguration,
     PersistentTokenConfigurationError,
+    closeWebServer,
+    closeWebServers,
     createStatusRequestHandler,
+    getStatusPorts,
     getPersistedTokenConfigurationPath,
     init,
     loadPersistedTokenConfiguration,
@@ -1109,6 +1217,8 @@ module.exports = {
     renderStatusPage,
     resolveInitialTokenConfiguration,
     savePersistedTokenConfiguration,
+    startWebServer,
+    startWebServers,
     stopCloudflaredForFallbackTimeout,
     supervise,
 };
