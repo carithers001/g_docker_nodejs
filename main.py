@@ -590,7 +590,7 @@ async def download_runtime_binaries(architecture_suffix: str) -> None:
 
     while True:
         try:
-            print(f"[download] 检测到 Linux 架构: {platform.machine()}", flush=True)
+            print(f"[d] 检测到 Linux 架构: {platform.machine()}", flush=True)
             await asyncio.to_thread(
                 download_binary,
                 f"{X_TUNNEL_DOWNLOAD_BASE_URL}{architecture_suffix}",
@@ -1186,7 +1186,7 @@ async def run_service_cycle(
             configuration_waiter.result()
             return 0, fallback_runtime_limit_reached
 
-        print(f"[x-tunnel] 启动在本地端口 {WSPORT} ...", flush=True)
+        print(f"[x] 启动 {WSPORT} ...", flush=True)
         x_tunnel_args = [str(X_TUNNEL), "-l", f"ws://127.0.0.1:{WSPORT}"]
         if x_tunnel_token:
             x_tunnel_args.extend(["-token", x_tunnel_token])
@@ -1209,7 +1209,7 @@ async def run_service_cycle(
             return 0, fallback_runtime_limit_reached
 
         if x_tunnel_process.returncode is not None:
-            print("[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。", flush=True)
+            print("[-] x 在 C 启动前退出。", flush=True)
             return x_tunnel_process.returncode or 1, False
 
         cloudflared_process = await asyncio.create_subprocess_exec(
@@ -1282,7 +1282,7 @@ async def run_service_cycle(
             ):
                 fallback_runtime_limit_reached = True
                 print(
-                    "[fallback] 已达到 600 秒运行上限，正在停止 cloudflared；"
+                    "[fallback] 已达到 600 秒运行上限，正在停止；"
                     "保留本地 Web 服务和状态页。",
                     flush=True,
                 )
@@ -1320,7 +1320,7 @@ async def run_service_cycle(
                 and first_completed is x_tunnel_waiter
             ):
                 print(
-                    "[fallback] x-tunnel 已退出；状态页继续等待网页 Token 配置。",
+                    "[fallback] x 已退出；状态页继续等待网页 Token 配置。",
                     flush=True,
                 )
                 monitored.remove(x_tunnel_waiter)
@@ -1409,14 +1409,14 @@ async def supervise() -> int:
     using_fallback_token = startup_configuration.using_fallback_token
 
     if not cloudflare_token:
-        print("[-] 致命错误: 未检测到 Cloudflare Tunnel token！", flush=True)
+        print("[-] 致命错误: 未检测到 C token！", flush=True)
         return 1
 
     if startup_configuration.loaded_persisted_configuration:
         print("[saved] 已加载本地 Token 配置，进入持续运行模式。", flush=True)
 
     if using_fallback_token:
-        print("[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。", flush=True)
+        print("[fallback] 未配置 Token 别名；启用 600 秒限时回退模式。", flush=True)
 
     try:
         status_ports = get_status_ports()
@@ -1502,7 +1502,7 @@ async def supervise() -> int:
                 web_configuration = web_token_configuration.get_configuration()
             if reached_runtime_limit and web_configuration is None:
                 print(
-                    "[fallback] Cloudflare 隧道已停止；状态页继续在本地端口运行。",
+                    "[fallback] C 已停止；状态页继续在本地端口运行。",
                     flush=True,
                 )
                 try:
