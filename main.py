@@ -22,8 +22,12 @@ from typing import Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 
+STATUS_DEFAULT_PORT = 3001
+STATUS_EXTRA_DEFAULT_PORT = 3000
 WSPORT = 8081
-STATUS_DEFAULT_PORT = 3000
+STATUS_EXTRA_PORT_ENVIRONMENT_NAME = "STATUS_EXTRA_PORT"
+MINIMUM_NETWORK_PORT = 1
+MAXIMUM_NETWORK_PORT = 65535
 RESTART_DELAY_SECONDS = 60
 DOWNLOAD_RETRY_DELAY_SECONDS = 120
 TUNNEL_STARTUP_CHECK_DELAY_SECONDS = 1
@@ -519,6 +523,32 @@ def get_status_port() -> int:
     return int(configured_port)
 
 
+def get_status_ports() -> tuple[int, int]:
+    """Return the legacy primary status port plus one independently configurable port."""
+
+    primary_port = get_status_port()
+    configured_extra_port = (
+        os.environ.get(STATUS_EXTRA_PORT_ENVIRONMENT_NAME)
+        or str(STATUS_EXTRA_DEFAULT_PORT)
+    )
+    try:
+        extra_port = int(configured_extra_port)
+    except ValueError as exc:
+        raise ValueError(
+            f"{STATUS_EXTRA_PORT_ENVIRONMENT_NAME} 必须是有效的端口号"
+        ) from exc
+
+    if not MINIMUM_NETWORK_PORT <= extra_port <= MAXIMUM_NETWORK_PORT:
+        raise ValueError(
+            f"{STATUS_EXTRA_PORT_ENVIRONMENT_NAME} 必须在 "
+            f"{MINIMUM_NETWORK_PORT} 到 {MAXIMUM_NETWORK_PORT} 之间"
+        )
+    if extra_port == primary_port:
+        raise ValueError("两个状态页监听端口不能相同")
+
+    return primary_port, extra_port
+
+
 def download_binary(url: str, destination: Path) -> None:
     """Download one executable atomically and make it executable for all users."""
     temporary_path = None
@@ -996,38 +1026,107 @@ class StatusHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def create_status_servers(
+    uptime_ports: tuple[int, ...],
+    web_token_configuration: Optional[WebTokenConfiguration] = None,
+    configuration_loop: Optional[asyncio.AbstractEventLoop] = None,
+    configuration_updates: Optional[asyncio.Queue[TunnelConfiguration]] = None,
+) -> tuple[ThreadingHTTPServer, ...]:
+    """Create status servers that share one web configuration and start time."""
+
+    if not uptime_ports:
+        raise ValueError("至少需要一个状态页监听端口")
+
+    start_time = time.time()
+    shared_web_token_configuration = (
+        web_token_configuration
+        if web_token_configuration is not None
+        else WebTokenConfiguration(environment_tokens_present=False)
+    )
+    http_servers = []
+    try:
+        for uptime_port in uptime_ports:
+            http_server = StatusHTTPServer(("", uptime_port), StatusRequestHandler)
+            http_server.start_time = start_time
+            http_server.start_date = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(start_time)
+            )
+            http_server.web_token_configuration = shared_web_token_configuration
+            http_server.configuration_loop = configuration_loop
+            http_server.configuration_updates = configuration_updates
+            http_servers.append(http_server)
+    except Exception:
+        for http_server in http_servers:
+            http_server.server_close()
+        raise
+
+    return tuple(http_servers)
+
+
 def create_status_server(
     uptime_port: int,
     web_token_configuration: Optional[WebTokenConfiguration] = None,
     configuration_loop: Optional[asyncio.AbstractEventLoop] = None,
     configuration_updates: Optional[asyncio.Queue[TunnelConfiguration]] = None,
 ) -> ThreadingHTTPServer:
-    """Create one status server whose uptime spans tunnel service cycles."""
+    """Create one status server for callers that still use the legacy API."""
 
-    start_time = time.time()
-    http_server = StatusHTTPServer(("", uptime_port), StatusRequestHandler)
-    http_server.start_time = start_time
-    http_server.start_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
-    http_server.web_token_configuration = (
-        web_token_configuration
-        if web_token_configuration is not None
-        else WebTokenConfiguration(environment_tokens_present=False)
+    return create_status_servers(
+        (uptime_port,),
+        web_token_configuration,
+        configuration_loop,
+        configuration_updates,
+    )[0]
+
+
+async def monitor_status_servers(
+    http_server_tasks: tuple[asyncio.Task[None], ...],
+) -> None:
+    """Finish when any status-server task stops and propagate its failure."""
+
+    if not http_server_tasks:
+        raise ValueError("至少需要一个状态页服务任务")
+
+    completed, _ = await asyncio.wait(
+        http_server_tasks,
+        return_when=asyncio.FIRST_COMPLETED,
     )
-    http_server.configuration_loop = configuration_loop
-    http_server.configuration_updates = configuration_updates
-    return http_server
+    for http_server_task in completed:
+        http_server_task.result()
+
+
+async def stop_status_servers(
+    http_servers: tuple[ThreadingHTTPServer, ...],
+    http_server_tasks: tuple[asyncio.Task[None], ...],
+) -> None:
+    """Stop every independently owned status server during application shutdown."""
+
+    if len(http_servers) != len(http_server_tasks):
+        raise ValueError("状态页服务与任务数量不一致")
+
+    shutdown_tasks = [
+        asyncio.to_thread(http_server.shutdown)
+        for http_server, http_server_task in zip(http_servers, http_server_tasks)
+        if not http_server_task.done()
+    ]
+    if shutdown_tasks:
+        await asyncio.gather(*shutdown_tasks)
+
+    for http_server in http_servers:
+        http_server.server_close()
+    for http_server_task in http_server_tasks:
+        http_server_task.cancel()
+    if http_server_tasks:
+        await asyncio.gather(*http_server_tasks, return_exceptions=True)
 
 
 async def stop_status_server(
     http_server: ThreadingHTTPServer,
     http_server_task: asyncio.Task[None],
 ) -> None:
-    """Stop the independently owned status server during application shutdown."""
-    if not http_server_task.done():
-        await asyncio.to_thread(http_server.shutdown)
-    http_server.server_close()
-    http_server_task.cancel()
-    await asyncio.gather(http_server_task, return_exceptions=True)
+    """Stop one status server for callers that still use the legacy API."""
+
+    await stop_status_servers((http_server,), (http_server_task,))
 
 
 async def terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -1052,6 +1151,7 @@ async def run_service_cycle(
     using_fallback_token: bool = False,
     x_tunnel_token: str = "",
     configuration_updates: Optional[asyncio.Queue[TunnelConfiguration]] = None,
+    status_ports: Optional[tuple[int, ...]] = None,
 ) -> tuple[int, bool]:
     """Run tunnel processes while the status server remains independently alive.
 
@@ -1142,7 +1242,12 @@ async def run_service_cycle(
 
         print("========================================", flush=True)
         print(f"当前本地服务端口: {WSPORT}", flush=True)
-        print(f"当前状态页端口: {uptime_port}", flush=True)
+        displayed_status_ports = status_ports or (uptime_port,)
+        print(
+            "当前状态页端口: "
+            + ", ".join(str(port) for port in displayed_status_ports),
+            flush=True,
+        )
         print("========================================", flush=True)
 
         background_tasks.append(
@@ -1314,11 +1419,11 @@ async def supervise() -> int:
         print("[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。", flush=True)
 
     try:
-        uptime_port = get_status_port()
-    except ValueError:
-        configured_port = os.environ.get("SERVER_PORT") or os.environ.get("PORT") or ""
-        print(f"[-] 状态页端口参数错误: {configured_port}", flush=True)
+        status_ports = get_status_ports()
+    except ValueError as exc:
+        print(f"[-] 状态页端口参数错误: {exc}", flush=True)
         return 1
+    uptime_port = status_ports[0]
 
     web_token_configuration = WebTokenConfiguration(
         environment_tokens_present=(
@@ -1329,8 +1434,8 @@ async def supervise() -> int:
     configuration_updates: asyncio.Queue[TunnelConfiguration] = asyncio.Queue()
 
     try:
-        http_server = create_status_server(
-            uptime_port,
+        http_servers = create_status_servers(
+            status_ports,
             web_token_configuration,
             asyncio.get_running_loop(),
             configuration_updates,
@@ -1339,8 +1444,16 @@ async def supervise() -> int:
         print(f"[-] 状态页启动失败: {exc}", file=sys.stderr, flush=True)
         return 1
 
-    http_server_task = asyncio.create_task(
-        asyncio.to_thread(http_server.serve_forever), name="http-server"
+    http_server_tasks = tuple(
+        asyncio.create_task(
+            asyncio.to_thread(http_server.serve_forever),
+            name=f"http-server-{http_server.server_port}",
+        )
+        for http_server in http_servers
+    )
+    status_server_task = asyncio.create_task(
+        monitor_status_servers(http_server_tasks),
+        name="status-server-monitor",
     )
 
     try:
@@ -1353,10 +1466,11 @@ async def supervise() -> int:
                     cloudflare_token,
                     uptime_port,
                     architecture_suffix,
-                    http_server_task,
+                    status_server_task,
                     using_fallback_token=True,
                     x_tunnel_token=x_tunnel_token,
                     configuration_updates=configuration_updates,
+                    status_ports=status_ports,
                 )
             except FileNotFoundError as exc:
                 web_configuration = (
@@ -1394,7 +1508,7 @@ async def supervise() -> int:
                 try:
                     await wait_for_web_configuration(
                         configuration_updates,
-                        http_server_task,
+                        status_server_task,
                     )
                     web_configuration = web_token_configuration.get_configuration()
                 except StatusServerStoppedError as exc:
@@ -1437,8 +1551,9 @@ async def supervise() -> int:
                     cloudflare_token,
                     uptime_port,
                     architecture_suffix,
-                    http_server_task,
+                    status_server_task,
                     x_tunnel_token=x_tunnel_token,
+                    status_ports=status_ports,
                 )
             except FileNotFoundError as exc:
                 print(f"[-] 未找到可执行文件: {exc.filename}", file=sys.stderr, flush=True)
@@ -1452,7 +1567,10 @@ async def supervise() -> int:
             await asyncio.sleep(RESTART_DELAY_SECONDS)
     finally:
         web_token_configuration.stop_accepting_web_configuration()
-        await stop_status_server(http_server, http_server_task)
+        if not status_server_task.done():
+            status_server_task.cancel()
+        await stop_status_servers(http_servers, http_server_tasks)
+        await asyncio.gather(status_server_task, return_exceptions=True)
 
     # The loop above intentionally does not terminate while an explicit token is set.
     return 0
