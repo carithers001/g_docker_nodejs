@@ -478,7 +478,7 @@ async function downloadRuntimeBinaries(architecture) {
 
     while (true) {
         try {
-            console.log(`[download] 检测到 Linux 架构: ${process.arch}`);
+            console.log(`[d] 检测到 Linux 架构: ${process.arch}`);
             await downloadFile(xTunnelUrl, X_TUNNEL);
             await downloadFile(cloudflaredUrl, CLOUDFLARED);
             return;
@@ -600,7 +600,7 @@ async function runServiceCycle(configuration, webTokenConfiguration) {
         return { kind: 'web-configuration', configuration: configurationAfterXTunnelStart };
     }
     if (childHasExited(xTunnel)) {
-        console.warn('[-] x-tunnel 在 Cloudflare Tunnel 启动前退出。');
+        console.warn('[-] x 在 C 启动前退出。');
         removeFileIfPresent(X_TUNNEL);
         removeFileIfPresent(CLOUDFLARED);
         return { kind: 'tunnel-exit' };
@@ -658,7 +658,7 @@ async function runServiceCycle(configuration, webTokenConfiguration) {
         return { kind: 'web-configuration', configuration: configurationAfterTunnelWait };
     }
     if (result.kind === 'fallback-timeout') {
-        console.log('[fallback] 已达到 600 秒运行上限，正在停止 cloudflared；保留本地 Web 服务和状态页。');
+        console.log('[fallback] 已达到 600 秒运行上限，正在停止 c；保留本地 Web 服务和状态页。');
         await stopCloudflaredForFallbackTimeout({ cloudflared });
         if (waitForWebConfiguration) {
             const configuredResult = await waitForWebConfiguration;
@@ -1167,11 +1167,11 @@ async function init(dependencies = {}) {
         loadPersistedTokenConfigurationFunction,
     });
     if (!initialTokenConfiguration.cloudflareToken) {
-        throw new Error('未检测到 Cloudflare Tunnel token');
+        throw new Error('未检测到 C token');
     }
 
     if (initialTokenConfiguration.usingFallbackToken) {
-        console.log('[fallback] 未配置 Cloudflare Token 别名；启用 600 秒限时回退模式。');
+        console.log('[fallback] 未配置 C 别名；启用 600 秒限时回退模式。');
     }
 
     const webTokenConfiguration = new WebTokenConfiguration({
