@@ -1193,6 +1193,7 @@ async def run_service_cycle(
         x_tunnel_process = await asyncio.create_subprocess_exec(
             *x_tunnel_args,
             stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         child_processes.append(x_tunnel_process)
 
@@ -1227,6 +1228,7 @@ async def run_service_cycle(
             "--token",
             cloudflare_token,
             stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         child_processes.append(cloudflared_process)
 
