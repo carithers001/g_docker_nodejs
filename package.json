@@ -1,0 +1,16 @@
+{
+  "name": "node-js-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js deployment entry point",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/index.test.js",
+    "build": "node --check index.js"
+  }
+}
