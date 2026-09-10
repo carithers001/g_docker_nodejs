@@ -1,0 +1,15 @@
+{
+  "name": "f",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js deployment entry point",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  }
+}
