@@ -1145,7 +1145,7 @@ def resolve_startup_sing_box_configuration() -> StartupSingBoxConfiguration:
     The established environment contract treats either configured value as an
     explicit startup choice.  A missing counterpart is filled from the local
     defaults, but a saved file is never mixed with an environment value.  The
-    web form is available only when neither source was configured.
+    Web configuration is permitted only when neither source was configured.
     """
 
     environment_cloudflare_token = get_cloudflare_token()
@@ -1728,15 +1728,12 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         return {field: values[0].strip() for field, values in parsed_fields.items()}
 
     def _send_status_page(self, include_body: bool) -> None:
-        web_token_configuration = self.server.web_token_configuration
         content = render_status_page(
             self.server.start_time,
             self.server.start_date,
-            (
-                render_login_panel()
-                if web_token_configuration.accepts_web_configuration()
-                else ""
-            ),
+            # Keep the login UI visible even when setup is locked.  The
+            # WebTokenConfiguration checks remain the authorization boundary.
+            render_login_panel(),
         )
         self._send_html(200, content, include_body=include_body)
 
@@ -2398,7 +2395,7 @@ async def supervise() -> int:
         print("[env] 已加载环境变量 sss 配置，进入持续运行模式。", flush=True)
     elif startup_configuration.partial_environment_configuration:
         print(
-            "[env] 环境变量配置不完整；缺失项使用默认值，网页配置保持关闭。",
+            "[env] 环境变量配置不完整；缺失项使用默认值，网页配置提交保持关闭。",
             flush=True,
         )
     elif startup_configuration.loaded_persisted_configuration:
