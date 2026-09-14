@@ -1215,6 +1215,7 @@ def build_sing_box_configuration(
                 "type": "cloudflared",
                 "tag": "ccc-in",
                 "token": credentials.cloudflare_token,
+                "protocol": "http2",
             },
             {
                 "type": "vless",
