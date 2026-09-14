@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -86,23 +87,23 @@ def main() -> int:
     # 就是运行本脚本时所在的目录
     workdir = Path.cwd().resolve()
     payload = workdir / asset_name
-
-    # 避免覆盖或误删用户已有文件
-    if payload.exists():
-        raise RuntimeError(
-            f"当前目录已存在 {payload.name}，为避免覆盖已停止。"
-        )
-
-    created_payload = False
+    staged_payload: Path | None = None
 
     try:
         digest = hashlib.sha256()
         total_bytes = 0
 
         with open_url(download_url, "application/octet-stream") as response:
-            # x：仅当文件不存在时创建
-            with payload.open("xb") as output:
-                created_payload = True
+            # Download and validate a new payload before unconditionally
+            # replacing any existing Release payload in the working directory.
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{asset_name}.",
+                suffix=".download",
+                dir=workdir,
+                delete=False,
+            ) as output:
+                staged_payload = Path(output.name)
 
                 while chunk := response.read(64 * 1024):
                     total_bytes += len(chunk)
@@ -119,11 +120,14 @@ def main() -> int:
         ):
             raise RuntimeError("SHA-256 校验失败，拒绝执行。")
 
-        with payload.open("rb") as file:
+        with staged_payload.open("rb") as file:
             if file.read(4) != importlib.util.MAGIC_NUMBER:
                 raise RuntimeError("下载的 .pyc 与当前 Python 不兼容。")
 
-        print(f"运行 Release {release.get('tag_name', '?')}：{payload.name}")
+        os.replace(staged_payload, payload)
+        staged_payload = None
+
+        print(f"运行 Release {release.get('tag_name', '?')}：{asset_name}")
 
         child_environment = os.environ.copy()
         # Keep main.py's established primary-port priority:
@@ -144,12 +148,18 @@ def main() -> int:
         return result.returncode
 
     finally:
-        # 无论运行成功、失败或异常，只删除本脚本本次创建的文件
-        if created_payload:
+        # Keep the replaced payload; only remove an unpromoted download.
+        if staged_payload is not None:
             try:
-                payload.unlink()
+                staged_payload.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as cleanup_error:
+                print(
+                    f"警告: 无法清理临时下载文件 {staged_payload.name}: "
+                    f"{cleanup_error}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
