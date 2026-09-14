@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,11 @@ ASSET_PREFIX = "main"
 
 NETWORK_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20 MiB
+
+# Fallback status-page ports when the caller does not supply environment values.
+# Change these two values together with any external port mapping.
+STATUS_PRIMARY_PORT = 3001
+STATUS_EXTRA_PORT = 3000
 
 
 def open_url(url: str, accept: str):
@@ -119,9 +125,20 @@ def main() -> int:
 
         print(f"运行 Release {release.get('tag_name', '?')}：{payload.name}")
 
+        child_environment = os.environ.copy()
+        # Keep main.py's established primary-port priority:
+        # SERVER_PORT, then PORT, then this fallback.
+        if not (
+            child_environment.get("SERVER_PORT")
+            or child_environment.get("PORT")
+        ):
+            child_environment["SERVER_PORT"] = str(STATUS_PRIMARY_PORT)
+        if not child_environment.get("STATUS_EXTRA_PORT"):
+            child_environment["STATUS_EXTRA_PORT"] = str(STATUS_EXTRA_PORT)
         result = subprocess.run(
             [sys.executable, str(payload)],
             cwd=str(workdir),
+            env=child_environment,
             check=False,
         )
         return result.returncode
